@@ -77,9 +77,13 @@ export const ServerHelloSchema = z.object({
   session_id: z.string(),
   audio_params: z.object({
     format: z.literal("opus"),
-    sample_rate: z.literal(24000),
-    channels: z.literal(1),
-    frame_duration: z.literal(60),
+    // M3.3c: echo the client audio_params instead of locking to 24kHz —
+    // esp32 firmware validates the negotiated sample_rate match and
+    // disconnects on mismatch (we hit this on the first real-device test
+    // — 30ms disconnect after serverHello). Accept any reasonable rate.
+    sample_rate: z.union([z.literal(8000), z.literal(16000), z.literal(24000), z.literal(48000)]),
+    channels: z.union([z.literal(1), z.literal(2)]),
+    frame_duration: z.union([z.literal(20), z.literal(40), z.literal(60), z.literal(80), z.literal(100), z.literal(120)]),
   }),
 });
 

@@ -87,18 +87,24 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
     return;
   }
 
-  // 2. Reply with ServerHello (use codec's sample rate for TTS: 24kHz)
-  const serverHello: ServerHello = {
+  // 2. Reply with ServerHello (echo client's audio_params so esp32 accepts
+  //    the negotiated format; V2 bridge also echoed 1:1, see
+  //    bridge/server.py:_handle_hello). esp32 firmware validates the
+  //    sample_rate match and disconnects on mismatch (we hit this on the
+  //    first real-device test — 30ms disconnect, 1008 close on mismatch).
+  const clientAudioParams = (helloMsg as { audio_params?: { sample_rate?: number; channels?: number; frame_duration?: number } }).audio_params
+    ?? { format: "opus" as const, sample_rate: 16000, channels: 1, frame_duration: 60 };
+  const serverHello = {
     type: "hello",
     transport: "websocket",
     session_id: sessionId,
     audio_params: {
-      format: "opus",
-      sample_rate: 24000,
-      channels: 1,
-      frame_duration: 60,
+      format: "opus" as const,
+      sample_rate: clientAudioParams.sample_rate ?? 16000,
+      channels: clientAudioParams.channels ?? 1,
+      frame_duration: clientAudioParams.frame_duration ?? 60,
     },
-  };
+  } as ServerHello;
   ws.send(serializeServerMessage(serverHello));
   log.info(`xiaozhi: ${deviceId} hello acked, session=${sessionId}`);
 
