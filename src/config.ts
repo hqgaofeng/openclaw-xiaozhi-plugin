@@ -41,7 +41,7 @@ export interface XiaozhiAccount {
     options?: Record<string, unknown>;
   };
   tts?: {
-    provider: "mock" | "edge" | "cloud";
+    provider: "mock" | "edge" | "minimax" | "cloud";
     options?: Record<string, unknown>;
   };
 }
@@ -62,7 +62,7 @@ export interface XiaozhiConfig {
     options?: Record<string, unknown>;
   };
   tts?: {
-    provider: "mock" | "edge" | "cloud";
+    provider: "mock" | "edge" | "minimax" | "cloud";
     options?: Record<string, unknown>;
   };
 }
