@@ -31,6 +31,36 @@ export function getXiaozhiConfig(): OpenClawConfig | null {
   return moduleCfg;
 }
 
+/**
+ * M3.4g: get ASR/TTS sub-config from the top-level OpenClaw config.
+ * openclaw's channel config schema validator STRIPS fields not declared in
+ * channelConfigs.<id>.schema, so ctx.account doesn't carry asr/tts.
+ * We read them from the raw cfg (which openclaw gives us in full).
+ *
+ * @see docs/plan-v3-xiaozhi-plugin.md §M3.4 (decision: read asr/tts from cfg)
+ */
+export function getXiaozhiAsrConfig(): {
+  provider: "mock" | "sherpa_onnx" | "cloud";
+  options?: Record<string, unknown>;
+} | undefined {
+  if (!moduleCfg) return undefined;
+  const channel = (moduleCfg as { channels?: { xiaozhi?: { asr?: unknown } } })
+    .channels?.xiaozhi;
+  if (!channel) return undefined;
+  return (channel as { asr?: { provider: "mock" | "sherpa_onnx" | "cloud"; options?: Record<string, unknown> } }).asr;
+}
+
+export function getXiaozhiTtsConfig(): {
+  provider: "mock" | "edge" | "minimax" | "cloud";
+  options?: Record<string, unknown>;
+} | undefined {
+  if (!moduleCfg) return undefined;
+  const channel = (moduleCfg as { channels?: { xiaozhi?: { tts?: unknown } } })
+    .channels?.xiaozhi;
+  if (!channel) return undefined;
+  return (channel as { tts?: { provider: "mock" | "edge" | "minimax" | "cloud"; options?: Record<string, unknown> } }).tts;
+}
+
 /** DirectDmRuntime shim. Explicit return type to dodge TS2742 (cross-package inferred type). */
 export function buildDirectDmRuntime(pluginRuntime: PluginRuntime): {
   channel: {

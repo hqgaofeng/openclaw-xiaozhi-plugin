@@ -121,7 +121,7 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
         const msg = parseClientMessage(asTextData(event));
         await dispatchClientMessage(ctx, session, msg, log);
       } catch (err) {
-        log.warn(`xiaozhi: bad message from ${deviceId}:`, (err as Error).message);
+        console.error("BAD MSG", deviceId, err); log.warn(`xiaozhi: bad message from ${deviceId}:`, (err as Error)?.stack ?? (err as Error)?.message ?? String(err));
       }
     } else if (event.kind === "binary") {
       // Opus frame for the active Listen session

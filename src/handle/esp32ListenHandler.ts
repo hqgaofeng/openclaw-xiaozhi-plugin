@@ -28,7 +28,7 @@ import {
   transitionTo,
   type SessionContext,
 } from "../session.js";
-import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig } from "../api.js";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig } from "../api.js";
 
 export interface ListenStopCtx {
   account: XiaozhiAccount;
@@ -74,7 +74,7 @@ export async function handleListenStop(
   );
 
   // 3. ASR transcribe
-  const asr = getASRProvider(ctx.account);
+  const asr = getASRProvider(getXiaozhiAsrConfig());
   log.info(`xiaozhi: ${ctx.deviceId} asr=${asr.name} transcribing...`);
   const t0 = Date.now();
   let asrResult;
@@ -113,7 +113,7 @@ export async function handleListenStop(
 
   // Pre-build TTS provider reference for the deliver callback
   const tts = (() => {
-    try { return getTTSProvider(ctx.account); } catch (e) {
+    try { return getTTSProvider(getXiaozhiTtsConfig()); } catch (e) {
       log.warn(`xiaozhi: TTS not configured (${(e as Error).message}), text-only delivery`);
       return null;
     }

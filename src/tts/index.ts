@@ -11,7 +11,6 @@
  *   - "cloud"  — stub for future providers
  */
 
-import type { XiaozhiAccount } from "../config.js";
 import type { TTSProvider } from "./types.js";
 import { TTSError } from "./types.js";
 import { MiniMaxTTS } from "./MiniMax.js";
@@ -19,9 +18,14 @@ import { MiniMaxTTS } from "./MiniMax.js";
 let cachedProvider: TTSProvider | null = null;
 let cachedConfigKey: string | null = null;
 
-export function getTTSProvider(account: XiaozhiAccount): TTSProvider {
-  const cfg = account.tts;
-  if (!cfg) throw new TTSError("XiaozhiAccount.tts is not configured");
+export interface TTSConfig {
+  provider: "mock" | "edge" | "minimax" | "cloud";
+  options?: Record<string, unknown>;
+}
+
+export function getTTSProvider(ttsCfg: TTSConfig | undefined): TTSProvider {
+  const cfg = ttsCfg;
+  if (!cfg) throw new TTSError("TTS config is not provided (channels.xiaozhi.tts in openclaw.json)");
 
   // Invalidate cache if config changes (plugin hot-reload).
   const key = JSON.stringify(cfg);
@@ -44,7 +48,7 @@ export function getTTSProvider(account: XiaozhiAccount): TTSProvider {
         speed?: number;
         volume?: number;
         pitch?: number;
-        connectTimeoutMs?: number;
+        timeoutMs?: number;
       };
       cachedProvider = new MiniMaxTTS({
         apiKey: opts.apiKey,
@@ -54,7 +58,7 @@ export function getTTSProvider(account: XiaozhiAccount): TTSProvider {
         speed: opts.speed,
         volume: opts.volume,
         pitch: opts.pitch,
-        connectTimeoutMs: opts.connectTimeoutMs,
+        timeoutMs: opts.timeoutMs,
       });
       break;
     }

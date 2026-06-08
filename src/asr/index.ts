@@ -10,7 +10,6 @@
  *   - "cloud"     — stub for future aliyun/volcengine/aliyun integration
  */
 
-import type { XiaozhiAccount } from "../config.js";
 import type { ASRProvider } from "./types.js";
 import { ASRError } from "./types.js";
 import { SherpaOnnxASR } from "./sherpa-onnx.js";
@@ -18,9 +17,14 @@ import { SherpaOnnxASR } from "./sherpa-onnx.js";
 let cachedProvider: ASRProvider | null = null;
 let cachedConfigKey: string | null = null;
 
-export function getASRProvider(account: XiaozhiAccount): ASRProvider {
-  const cfg = account.asr;
-  if (!cfg) throw new ASRError("XiaozhiAccount.asr is not configured");
+export interface ASRConfig {
+  provider: "mock" | "sherpa_onnx" | "cloud";
+  options?: Record<string, unknown>;
+}
+
+export function getASRProvider(asrCfg: ASRConfig | undefined): ASRProvider {
+  const cfg = asrCfg;
+  if (!cfg) throw new ASRError("ASR config is not provided (channels.xiaozhi.asr in openclaw.json)");
 
   // Invalidate cache if config changes (plugin hot-reload)
   const key = JSON.stringify(cfg);
