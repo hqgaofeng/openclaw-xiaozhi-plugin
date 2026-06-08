@@ -235,7 +235,7 @@ async function dispatchClientMessage(
         // M3.2 stub: just record the start; full audio dispatch lands in M3.4
         // when we have the openclaw channelRuntime wired in.
         transitionTo(session, "LISTENING");
-        log.debug(`xiaozhi: ${ctx.deviceId} listen start`);
+        log.info(`xiaozhi: ${ctx.deviceId} listen start, sample_rate=${(session as { audioSampleRate?: number }).audioSampleRate ?? "?"}`);
       } else if (msg.state === "stop") {
         transitionTo(session, "THINKING");
         const frames = drainAudioBuffer(session);

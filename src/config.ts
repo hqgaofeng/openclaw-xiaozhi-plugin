@@ -34,6 +34,16 @@ export interface XiaozhiAccount {
 
   // Session
   sessionIdPrefix: string;
+
+  // M3.4: ASR / TTS provider config (parallel to V2 bridge config.yaml)
+  asr?: {
+    provider: "mock" | "sherpa_onnx" | "cloud";
+    options?: Record<string, unknown>;
+  };
+  tts?: {
+    provider: "mock" | "edge" | "cloud";
+    options?: Record<string, unknown>;
+  };
 }
 
 export interface XiaozhiConfig {
@@ -45,6 +55,16 @@ export interface XiaozhiConfig {
   authTokens: Record<string, string>;
   globalAuthToken: string;
   sessionIdPrefix: string;
+
+  // M3.4: ASR / TTS provider config (parallel to V2 bridge config.yaml)
+  asr?: {
+    provider: "mock" | "sherpa_onnx" | "cloud";
+    options?: Record<string, unknown>;
+  };
+  tts?: {
+    provider: "mock" | "edge" | "cloud";
+    options?: Record<string, unknown>;
+  };
 }
 
 export const DEFAULT_CONFIG: Omit<XiaozhiConfig, "accountId"> = {
