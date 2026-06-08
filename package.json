@@ -1,0 +1,47 @@
+{
+  "name": "openclaw-xiaozhi-plugin",
+  "version": "0.3.0",
+  "description": "ESP32 xiaozhi protocol as a native openclaw channel",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "manifest.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "openclaw",
+    "xiaozhi",
+    "esp32",
+    "channel-plugin",
+    "websocket",
+    "mcp"
+  ],
+  "author": "Allen Gao",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "openclaw": "2026.6.1",
+    "pino": "^9.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  }
+}

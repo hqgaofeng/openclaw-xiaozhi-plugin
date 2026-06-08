@@ -1,0 +1,11 @@
+{
+  "id": "xiaozhi",
+  "name": "Xiaozhi Device Channel",
+  "version": "0.3.0",
+  "description": "ESP32 xiaozhi protocol as a native openclaw channel",
+  "openclaw": {
+    "minVersion": "2026.6.0"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts"
+}
