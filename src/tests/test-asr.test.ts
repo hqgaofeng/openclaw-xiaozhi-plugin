@@ -37,10 +37,7 @@ describe("int16ToFloat32", () => {
 
 describe("getASRProvider", () => {
   it("returns mock provider for provider=mock", () => {
-    const account = {
-      asr: { provider: "mock" as const, options: {} },
-    } as unknown as XiaozhiAccount;
-    const provider = getASRProvider(account);
+    const provider = getASRProvider({ provider: "mock", options: {} });
     expect(provider.name).toBe("mock");
     expect(provider.transcribe(Buffer.alloc(0))).resolves.toMatchObject({
       text: expect.stringMatching(/\[mock-asr-call-\d+\]/),
@@ -51,21 +48,21 @@ describe("getASRProvider", () => {
     const account = {
       asr: { provider: "unknown" as never, options: {} },
     } as unknown as XiaozhiAccount;
-    expect(() => getASRProvider(account)).toThrow(/unknown ASR provider/);
+    expect(() => getASRProvider(account.asr)).toThrow(/unknown ASR provider/);
   });
 
   it("throws on cloud provider (not yet implemented)", () => {
     const account = {
       asr: { provider: "cloud" as const, options: {} },
     } as unknown as XiaozhiAccount;
-    expect(() => getASRProvider(account)).toThrow(/not yet implemented/);
+    expect(() => getASRProvider(account.asr)).toThrow(/not yet implemented/);
   });
 
   it("throws on sherpa_onnx without modelDir", () => {
     const account = {
       asr: { provider: "sherpa_onnx" as const, options: {} },
     } as unknown as XiaozhiAccount;
-    expect(() => getASRProvider(account)).toThrow(/modelDir is required/);
+    expect(() => getASRProvider(account.asr)).toThrow(/modelDir is required/);
   });
 
   it("caches the provider on repeated calls with same config", () => {
@@ -73,8 +70,8 @@ describe("getASRProvider", () => {
     const account = {
       asr: { provider: "mock" as const, options: {} },
     } as unknown as XiaozhiAccount;
-    const a = getASRProvider(account);
-    const b = getASRProvider(account);
+    const a = getASRProvider(account.asr);
+    const b = getASRProvider(account.asr);
     expect(a).toBe(b);
   });
 });

@@ -15,22 +15,8 @@ import {
   type TTSChunk,
 } from "../tts/index.js";
 import { splitSentences } from "../tts/MiniMax.js";
-import type { XiaozhiAccount } from "../config.js";
 
-function makeAccount(tts: XiaozhiAccount["tts"]): XiaozhiAccount {
-  return {
-    accountId: "test",
-    enabled: true,
-    host: "0.0.0.0",
-    port: 18789,
-    path: "/xiaozhi/v1/",
-    tls: { enabled: false },
-    authTokens: {},
-    globalAuthToken: "",
-    sessionIdPrefix: "xiaozhi",
-    tts,
-  };
-}
+
 
 describe("splitSentences (MiniMax T2A helper)", () => {
   it("splits on Chinese full stop 。", () => {
@@ -81,41 +67,39 @@ describe("getTTSProvider", () => {
   afterEach(() => disposeTTSProvider());
 
   it("returns mock provider for provider=mock", () => {
-    const p = getTTSProvider(makeAccount({ provider: "mock" }));
+    const p = getTTSProvider({ provider: "mock" });
     expect(p.name).toBe("mock");
   });
 
   it("caches the same provider across calls", () => {
-    const a = getTTSProvider(makeAccount({ provider: "mock" }));
-    const b = getTTSProvider(makeAccount({ provider: "mock" }));
+    const a = getTTSProvider({ provider: "mock" });
+    const b = getTTSProvider({ provider: "mock" });
     expect(a).toBe(b);
   });
 
   it("invalidates cache when config changes", () => {
-    const a = getTTSProvider(makeAccount({ provider: "mock" }));
+    const a = getTTSProvider({ provider: "mock" });
     const b = getTTSProvider(
-      makeAccount({ provider: "mock", options: { foo: 1 } }),
+      { provider: "mock", options: { foo: 1 } },
     );
     expect(a).not.toBe(b);
   });
 
   it("throws for unknown provider", () => {
     expect(() =>
-      getTTSProvider(
-        makeAccount({ provider: "weird" as unknown as "mock" }),
-      ),
+      getTTSProvider({ provider: "weird" as unknown as "mock" }),
     ).toThrow(TTSError);
   });
 
   it("throws for edge provider (M3.4b uses MiniMax, edge is future)", () => {
     expect(() =>
-      getTTSProvider(makeAccount({ provider: "edge" })),
+      getTTSProvider({ provider: "edge" }),
     ).toThrow(/edge TTS provider not yet implemented/);
   });
 
   it("throws for cloud provider (future)", () => {
     expect(() =>
-      getTTSProvider(makeAccount({ provider: "cloud" })),
+      getTTSProvider({ provider: "cloud" }),
     ).toThrow(/cloud TTS provider not yet implemented/);
   });
 
@@ -124,7 +108,7 @@ describe("getTTSProvider", () => {
     delete process.env.MINIMAX_API_KEY;
     try {
       expect(() =>
-        getTTSProvider(makeAccount({ provider: "minimax" })),
+        getTTSProvider({ provider: "minimax" }),
       ).toThrow(/apiKey or MINIMAX_API_KEY env var required/);
     } finally {
       if (orig !== undefined) process.env.MINIMAX_API_KEY = orig;
@@ -132,12 +116,10 @@ describe("getTTSProvider", () => {
   });
 
   it("constructs MiniMaxTTS when apiKey provided in options", () => {
-    const p = getTTSProvider(
-      makeAccount({
-        provider: "minimax",
-        options: { apiKey: "test-key", voice: "male-qn-jingying" },
-      }),
-    );
+    const p = getTTSProvider({
+      provider: "minimax",
+      options: { apiKey: "test-key", voice: "male-qn-jingying" },
+    });
     expect(p.name).toBe("MiniMaxTTS");
   });
 });
@@ -146,7 +128,7 @@ describe("mock TTS synthesize", () => {
   let provider: TTSProvider;
 
   beforeEach(() => {
-    provider = getTTSProvider(makeAccount({ provider: "mock" }));
+    provider = getTTSProvider({ provider: "mock" });
   });
   afterEach(() => provider.dispose());
 
