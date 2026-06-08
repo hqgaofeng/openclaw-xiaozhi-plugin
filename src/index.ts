@@ -12,6 +12,7 @@
  */
 
 import { defineBundledChannelEntry } from "openclaw/plugin-sdk/channel-entry-contract";
+import { registerXiaozhiPlugin } from "./register.js";
 
 export default defineBundledChannelEntry({
   id: "xiaozhi",
@@ -28,4 +29,9 @@ export default defineBundledChannelEntry({
     specifier: "./api.js",
     exportName: "setXiaozhiRuntime",
   },
+
+  // M3.5: plugin-level register hook for HTTP routes (OTA endpoint).
+  // ChannelPlugin doesn't have access to OpenClawPluginApi; the
+  // defineBundledChannelEntry contract does.
+  registerFull: (api) => registerXiaozhiPlugin(api),
 });

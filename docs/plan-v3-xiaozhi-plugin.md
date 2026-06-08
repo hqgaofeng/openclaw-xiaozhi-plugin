@@ -563,34 +563,36 @@ openclaw-xiaozhi-plugin/
 - esp32 实**物**接**入**成**功** (说**话**有**回**复**)
 - TTS 音**质** 验**证** (MiniMax T2A v2 vs edge)
 
-### 4.6 M3.5: 收**尾** + 复**盘** v0.3.0** — 0.5 天
+### 4.6 M3.5: 收**尾** + 复**盘** v0.3.0** — 0.5 天 ✅ 2026-06-08 done
 
 **撤**销**清单**:
-- [ ] **停** docker compose (bridge 服**务** 3 容器)
-- [ ] **卸**载** nginx location `/xiaozhi/v1/`** (或**者**改**为**转发**到** openclaw 18789, 一**致**)
-- [ ] **打** tag: `xiaozhi-bridge v0.2.13-legacy` (标**记**为** legacy)
-- [ ] **保**留** xiaozhi-bridge 仓**库** (不**删**)
-- [ ] **转**移** `data/bridge.db`** (如**果**要**保**留**历**史**, 写** migration 脚**本**; 否**则**丢**弃**)
+- [x] **停** docker compose (bridge 服**务** 3 容器) — P1 step 1 (xiaozhi-bridge 8000, xiaozhi-web 5180, datang-novel 8092)
+- [x] **卸**载** nginx location `/xiaozhi/v1/`** (或**者**改**为**转发**到** openclaw 18789, 一**致**) — nginx /xiaozhi/ → 18790 (V3 plugin)
+- [x] **打** tag: `xiaozhi-bridge v0.2.13-legacy` (标**记**为** legacy) — pushed
+- [x] **保**留** xiaozhi-bridge 仓**库** (不**删**) — frozen as archival
+- [x] **卸** xiaozhi-bridge-api 8001 container — M3.5 (OTA migrated to V3 plugin on 18790)
+- [x] nginx /api/ 8001 → 18790 (V3 plugin) — done
 
 **文**档**更**新**:
-- [ ] README.md: 加 v0.3.0 一**行** (架**构**反**转**版)
-- [ ] CHANGELOG: 加 v0.3.0 大**段**
-- [ ] architecture.md: 重**画**架**构**图** (这**个**新**文**档**就**是** v3 架**构**)
-- [ ] plan-v3-xiaozhi-plugin.md (本**文**档**) 移**到** `docs/archive/` (标**记**完**成**)
-- [ ] MEMORY.md §4.39: V3 架**构**反**转** 5 阶**段**实**施**复**盘**
+- [x] README.md: 加 v0.3.0 一**行** (架**构**反**转**版) — full rewrite
+- [x] CHANGELOG: 加 v0.3.0 大**段** — new file
+- [x] architecture.md: 重**画**架**构**图** (这**个**新**文**档**就**是** v3 架**构**) — new file (8184 bytes)
+- [x] sdk-research-v3.md: 加 §0.1 v0.3.0 implementation notes (9 corrections)
+- [x] plan-v3-xiaozhi-plugin.md (本**文**档**) 移**到** `docs/archive/` (标**记**完**成**) — M3.5 done
+- [x] MEMORY.md §4.39: V3 架**构**反**转** 5 阶**段**实**施**复**盘** — in memory/2026-06-08.md
 
 **v0.3.0 tag** + push**:
-- [ ] v0.3.0 commit: xiaozhi-bridge 打 legacy tag (不**推** v0.3.0 到 xiaozhi-bridge, 那**是** plugin 的**版**本**)
-- [ ] v0.3.0 tag on openclaw-xiaozhi-plugin: 推到** GitHub
+- [x] v0.3.0 commit: xiaozhi-bridge 打 legacy tag (不**推** v0.3.0 到 xiaozhi-bridge, 那**是** plugin 的**版**本**)
+- [x] v0.3.0 tag on openclaw-xiaozhi-plugin: 推到** GitHub
 
 **总**复**盘**:
-- [ ] 本**次**新**增**几**行** plugin 代**码**?
-- [ ] 删**了**几**行** bridge 代**码**?
-- [ ] 端**到**端**延**迟** 比** V0.2.13 怎**么**样**?
-- [ ] TTS 音**质** 怎**么**样**?
-- [ ] 记**忆** 按**设**备**隔**离**了**吗**?
-- [ ] 反**向** MCP 工**具** 透**传**了**吗**?
-- [ ] 周**一** SenseAudio key **到**了**怎**么**切**?
+- [x] 本**次**新**增**几**行** plugin 代**码**? — 11 src files, ~2200 LOC TS
+- [x] 删**了**几**行** bridge 代**码**? — V2 6600 LOC Python frozen
+- [ ] 端**到**端**延**迟** 比** V0.2.13 怎**么**样**? — same RTF 0.74 (WASM) vs 0.43 (V2 native)
+- [x] TTS 音**质** 怎**么**样**? — MiniMax T2A v2 (better than V2 edge)
+- [ ] 记**忆** 按**设**备**隔**离**了**吗**? — M3.6 todo
+- [ ] 反**向** MCP 工**具** 透**传**了**吗**? — M3.7 todo
+- [ ] 周**一** SenseAudio key **到**了**怎**么**切**? — M3.8 (out of scope for v0.3.0)
 
 ---
 

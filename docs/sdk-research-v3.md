@@ -1,10 +1,31 @@
 # V3 SDK Research: openclaw xiaozhi Plugin (M3.1 阶段产出)
 
-> **Status**: Research complete (1.5 个月实战经验 + 官方 SDK 调研)
+> **Status**: Research complete (1.5 个月实战经验 + 官方 SDK 调研) — **Verified against v0.3.0 implementation**
 > **Author**: Jarvis (OpenClaw runtime)
 > **Date**: 2026-06-06 (周六凌晨)
 > **Purpose**: 把"我们 1.5 个月摸出来的 xiaozhi 协议经验"和"openclaw SDK 接口"对齐成 1:1 映射表
 > **Audience**: M3.2 写 plugin 的我 (下次跑这个研究时)
+
+## 0.1 v0.3.0 implementation notes (2026-06-08 M3.5 验证后)
+
+This doc was written **before** the actual implementation. Below are the
+SDK discrepancies that the v0.3.0 code actually had to correct vs. the
+original research:
+
+| # | Doc said | Real SDK | Fix |
+|---|---|---|---|
+| 1 | `import { ChannelGatewayAdapter } from "openclaw/plugin-sdk"` | it's in `openclaw/plugin-sdk/channel-runtime` subpath | Use subpath import |
+| 2 | `meta: { label, icon }` | `meta: { id, label, selectionLabel, blurb, systemImage, ... }` | Use `systemImage: "mic.fill"` |
+| 3 | `capabilities: { text, voice, audio, mcp, thread }` | `capabilities: { chatTypes: ["direct"], media, tts.voice.synthesisTarget }` | Use real field names |
+| 4 | `ChannelAgentTool.execute: () => string` | `(toolCallId, params, signal?, onUpdate?) => Promise<AgentToolResult>` | Use full signature |
+| 5 | `createPluginRuntimeStore` at `openclaw/plugin-sdk` | `openclaw/plugin-sdk/runtime-store` | Use subpath |
+| 6 | `index.ts` exports `xiaozhiPlugin` | `defineBundledChannelEntry({plugin: {specifier, exportName}, ...})` | Use contract |
+| 7 | `package.json.openclaw` field | `package.json.openclaw.extensions: ["./dist/index.js"]` | Use `extensions` array |
+| 8 | `ctx.account` carries full sub-config | `ctx.account` is TypeBox-validated, **strips undeclared fields** | Read asr/tts from `moduleCfg` via `getXiaozhiAsrConfig()` + `getXiaozhiTtsConfig()` |
+| 9 | (not in original doc) plugin needs `registerFull: (api) => registerHttpRoute(...)` for OTA | openclaw SDK has `api.registerHttpRoute` (replaces deprecated `registerHttpHandler`) | Use `defineBundledChannelEntry.registerFull` for plugin-level HTTP routes |
+
+All 9 corrections baked into v0.3.0 source. No need to read this doc
+during M3.6+ work — just look at the code.
 
 ---
 

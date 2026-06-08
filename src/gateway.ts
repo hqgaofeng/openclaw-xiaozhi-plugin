@@ -22,6 +22,7 @@ import type { XiaozhiAccount } from "./config.js";
 import { handleEsp32Connection } from "./inbound.js";
 import { getDeviceRegistry } from "./tools.js";
 import { setXiaozhiConfig } from "./api.js";
+import { handleOtaRequest } from "./ota.js";
 
 export interface GatewayContext {
   cfg: unknown;
@@ -102,7 +103,26 @@ export async function startWssServer(
   abortSignal: AbortSignal,
 ): Promise<HttpServer> {
   // For TLS support (M3.4), wrap with https.Server. For M3.2/M3.3, plain ws.
-  const httpServer = createServer((_req, res) => {
+  // M3.5: Same HTTP server also serves /api/xiaozhi/ota[ /] (POST + GET) for
+  // xiaozhi-esp32 firmware OTA checks. WebSocket upgrade still wins for the
+  // account.path prefix (handled by the WSS attached below).
+  const httpServer = createServer((req, res) => {
+    const url = req.url ?? "";
+    if (
+      url === "/api/xiaozhi/ota" ||
+      url === "/api/xiaozhi/ota/" ||
+      url === "/health"
+    ) {
+      // Async handler; Node http will keep the socket open until res.end().
+      Promise.resolve(handleOtaRequest(req, res)).catch((err) => {
+        console.error(`[xiaozhi] HTTP handler error: ${(err as Error).message}`);
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "text/plain" });
+          res.end("Internal error\n");
+        }
+      });
+      return;
+    }
     res.writeHead(426, { "Content-Type": "text/plain" });
     res.end("Upgrade required: this endpoint only accepts WebSocket connections.\n");
   });
