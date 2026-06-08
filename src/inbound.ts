@@ -30,13 +30,13 @@ import {
 import {
   createSessionContext,
   appendAudioFrame,
-  drainAudioBuffer,
   cleanupSession,
   transitionTo,
   type SessionContext,
 } from "./session.js";
 import type { SessionStore } from "./gateway.js";
 import { sendMcpResponse } from "./mcp/outbound.js";
+import { handleListenStop } from "./handle/esp32ListenHandler.js";
 
 export interface Esp32ConnectionCtx {
   account: XiaozhiAccount;
@@ -237,10 +237,9 @@ async function dispatchClientMessage(
         transitionTo(session, "LISTENING");
         log.info(`xiaozhi: ${ctx.deviceId} listen start, sample_rate=${(session as { audioSampleRate?: number }).audioSampleRate ?? "?"}`);
       } else if (msg.state === "stop") {
-        transitionTo(session, "THINKING");
-        const frames = drainAudioBuffer(session);
-        log.info(`xiaozhi: ${ctx.deviceId} listen stop, ${frames.length} frames buffered`);
-        // M3.4: forward frames to openclaw audio queue for ASR + LLM + TTS
+        // M3.4c/d: full pipeline — drain → ASR → dispatch → TTS
+        await handleListenStop(ctx, session);
+        return;
       } else if (msg.state === "detect") {
         // Listen(detect) + text — bypass ASR, send text directly
         const text = (msg.text ?? "").trim();
