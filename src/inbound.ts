@@ -15,7 +15,11 @@
 
 import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/channel-runtime";
 import type { WebSocket } from "ws";
+import { randomUUID } from "node:crypto";
 import type { XiaozhiAccount } from "./config.js";
+import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/channel-inbound";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig } from "./api.js";
+import { sendSttMessage, sendLlmMessage } from "./outbound.js";
 import { OpusCodec } from "./audio.js";
 import {
   parseClientMessage,
@@ -233,8 +237,60 @@ async function dispatchClientMessage(
         // M3.4: forward frames to openclaw audio queue for ASR + LLM + TTS
       } else if (msg.state === "detect") {
         // Listen(detect) + text — bypass ASR, send text directly
-        log.info(`xiaozhi: ${ctx.deviceId} detect: ${msg.text ?? ""}`);
-        // M3.4: dispatch msg.text as inbound message
+        const text = (msg.text ?? "").trim();
+        if (text.length === 0) {
+          log.warn(`xiaozhi: ${ctx.deviceId} detect with empty text`);
+          return;
+        }
+        log.info(`xiaozhi: ${ctx.deviceId} detect: ${text}`);
+        transitionTo(session, "THINKING");
+
+        // Dispatch into openclaw agent loop
+        const runtime = getXiaozhiRuntime();
+        if (!runtime) {
+          log.error(`xiaozhi: runtime not initialized, dropping detect text`);
+          transitionTo(session, "IDLE");
+          return;
+        }
+        const dmRuntime = buildDirectDmRuntime(runtime) as never;
+        try {
+          // Send STT echo first so esp32 displays the recognized text
+          sendSttMessage(ctx.ws, ctx.sessionId, text);
+
+          const dispatchResult = await dispatchInboundDirectDmWithRuntime({
+            cfg: getXiaozhiConfig() as never,
+            runtime: dmRuntime,
+            channel: "xiaozhi",
+            channelLabel: "Xiaozhi Device",
+            accountId: ctx.account.accountId,
+            peer: { kind: "direct", id: ctx.deviceId },
+            senderId: ctx.deviceId,
+            senderAddress: `xiaozhi:${ctx.deviceId}`,
+            recipientAddress: `xiaozhi:${ctx.deviceId}`,
+            conversationLabel: ctx.deviceId,
+            rawBody: text,
+            messageId: randomUUID(),
+            timestamp: Date.now(),
+            deliver: async (payload) => {
+              // M3.3b: outbound text only (no TTS audio yet).
+              // TTS pipeline lands in M3.4.
+              const text = String((payload as { text?: string })?.text ?? "").trim();
+              if (text) {
+                sendLlmMessage(ctx.ws, ctx.sessionId, undefined, text);
+                log.info(`xiaozhi: ${ctx.deviceId} delivered: ${text.slice(0, 80)}`);
+              }
+            },
+            onRecordError: (err) => log.error(`xiaozhi: record error:`, err),
+            onDispatchError: (err) => log.error(`xiaozhi: dispatch error:`, err),
+          });
+
+          log.info(`xiaozhi: ${ctx.deviceId} dispatch complete (sessionKey=${dispatchResult.route.sessionKey})`);
+        } catch (err) {
+          log.error(`xiaozhi: dispatch failed for ${ctx.deviceId}:`, (err as Error).message);
+          sendLlmMessage(ctx.ws, ctx.sessionId, undefined, `Error: ${(err as Error).message}`);
+        } finally {
+          transitionTo(session, "IDLE");
+        }
       }
       return;
     }

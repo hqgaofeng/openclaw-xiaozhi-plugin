@@ -21,6 +21,7 @@ import type { ChannelGatewayAdapter } from "openclaw/plugin-sdk/channel-runtime"
 import type { XiaozhiAccount } from "./config.js";
 import { handleEsp32Connection } from "./inbound.js";
 import { getDeviceRegistry } from "./tools.js";
+import { setXiaozhiConfig } from "./api.js";
 
 export interface GatewayContext {
   cfg: unknown;
@@ -185,6 +186,7 @@ export function createXiaozhiGatewayAdapter(): ChannelGatewayAdapter<XiaozhiAcco
       };
       const abortSignal: AbortSignal = (ctx as unknown as GatewayContext).abortSignal ?? new AbortController().signal;
       const account: XiaozhiAccount = (ctx as unknown as GatewayContext).account;
+      const cfg: unknown = (ctx as unknown as GatewayContext).cfg;
 
       // Shared session store (across all devices in this account).
       // M3.2: in-memory only + globally exported via tools.getDeviceRegistry().
@@ -192,6 +194,9 @@ export function createXiaozhiGatewayAdapter(): ChannelGatewayAdapter<XiaozhiAcco
       const sessionStore: SessionStore = createGlobalSessionStore();
 
       await startWssServer(account, sessionStore, log, abortSignal);
+      // M3.3b: capture cfg module-level so dispatchInboundDirectDmWithRuntime
+      // can resolve envelope format options.
+      setXiaozhiConfig(cfg as never);
       // Block until abort
       await new Promise<void>((resolve) => {
         if (abortSignal.aborted) resolve();
