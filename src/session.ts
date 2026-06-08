@@ -12,13 +12,21 @@
  *      └──────────────────tts stop────────────────────────────┘
  */
 
+import { OpusCodec } from "./audio.js";
+
 export type SessionState = "IDLE" | "LISTENING" | "THINKING" | "SPEAKING";
+
+export interface PendingMcpCall {
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+}
 
 export interface SessionContext {
   // Identity
   deviceId: string;
   sessionId: string;
-  openclawSessionKey: string;  // = `xiaozhi-${deviceId}` (M3.6: per-device memory)
+  /** M3.6: per-device memory isolation. */
+  openclawSessionKey: string;
 
   // State
   state: SessionState;
@@ -27,44 +35,90 @@ export interface SessionContext {
 
   // Pending MCP calls (V2 #7 / M3.7)
   // Map: mcp_request_id (string|number) → Promise resolver
-  pendingMcpCalls: Map<string, {
-    resolve: (value: unknown) => void;
-    reject: (reason: unknown) => void;
-  }>;
+  pendingMcpCalls: Map<string, PendingMcpCall>;
 
   // Audio
   audioBuffer: Buffer[];      // accumulating Opus frames during LISTENING
-  codec: import("./audio.js").OpusCodec;
+  codec: OpusCodec;
 
   // VAD
   vad: unknown;               // SileroVAD instance (or null if not enabled)
-  wakeGraceUntil: number;     // timestamp — VAD disabled until this time
+  /** VAD disabled until this timestamp (wake word tail buffer). */
+  wakeGraceUntil: number;
 }
 
 export function createSessionContext(
   deviceId: string,
   sessionId: string,
-  codec: import("./audio.js").OpusCodec,
+  codec: OpusCodec,
 ): SessionContext {
-  // TODO(M3.2): implement — return fully-initialized SessionContext
-  //   - openclawSessionKey = `xiaozhi-${deviceId}` (M3.6)
-  //   - state = "IDLE"
-  //   - pendingMcpCalls = new Map()
-  //   - audioBuffer = []
-  //   - createdAt = lastActivityAt = Date.now()
-  //   - vad = null (A3 过渡期不跑服务端 VAD)
-  //   - wakeGraceUntil = 0
+  const now = Date.now();
   return {
     deviceId,
     sessionId,
     openclawSessionKey: `xiaozhi-${deviceId}`,
     state: "IDLE",
-    createdAt: Date.now(),
-    lastActivityAt: Date.now(),
+    createdAt: now,
+    lastActivityAt: now,
     pendingMcpCalls: new Map(),
     audioBuffer: [],
     codec,
     vad: null,
     wakeGraceUntil: 0,
   };
+}
+
+/** Transition to a new state, updating lastActivityAt. */
+export function transitionTo(session: SessionContext, state: SessionState): void {
+  session.state = state;
+  session.lastActivityAt = Date.now();
+}
+
+/** Append an Opus frame to the session audio buffer. */
+export function appendAudioFrame(session: SessionContext, opusFrame: Buffer): void {
+  session.audioBuffer.push(opusFrame);
+  session.lastActivityAt = Date.now();
+}
+
+/** Drain the audio buffer and return all accumulated frames. */
+export function drainAudioBuffer(session: SessionContext): Buffer[] {
+  const frames = session.audioBuffer;
+  session.audioBuffer = [];
+  return frames;
+}
+
+/** Add a pending MCP call and return the Promise that resolves when it completes. */
+export function addPendingMcpCall(
+  session: SessionContext,
+  requestId: string,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    session.pendingMcpCalls.set(requestId, { resolve, reject });
+  });
+}
+
+/** Resolve a pending MCP call (called when esp32 sends a response). */
+export function resolvePendingMcpCall(
+  session: SessionContext,
+  requestId: string,
+  result: unknown,
+): boolean {
+  const call = session.pendingMcpCalls.get(requestId);
+  if (!call) return false;
+  session.pendingMcpCalls.delete(requestId);
+  call.resolve(result);
+  return true;
+}
+
+/**
+ * Cleanup on session disconnect:
+ *   1. Reject all pending MCP calls with a CancellationError
+ *   2. Drop the audio buffer
+ */
+export function cleanupSession(session: SessionContext): void {
+  for (const [id, call] of session.pendingMcpCalls.entries()) {
+    call.reject(new Error("session_disconnected"));
+    session.pendingMcpCalls.delete(id);
+  }
+  session.audioBuffer = [];
 }
