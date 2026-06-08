@@ -36,6 +36,8 @@ import {
 } from "./session.js";
 import type { SessionStore } from "./gateway.js";
 import { resolveMcpResponse } from "./mcp/outbound.js";
+import { registerEsp32Tools, unregisterEsp32Tools } from "./mcp/registry.js";
+import type { McpTool } from "./mcp/protocol.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
 
 export interface Esp32ConnectionCtx {
@@ -144,6 +146,7 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
 
   cleanupSession(session);
   ctx.sessionStore.unregister(deviceId);
+  unregisterEsp32Tools(deviceId);
 }
 
 interface WsEvent {
@@ -329,19 +332,24 @@ async function dispatchClientMessage(
           typeof payload.result === "object" &&
           Array.isArray((payload.result as { tools?: unknown }).tools);
         if (isToolsList) {
-          // Hand the tool list to the agent-tools pipeline.
-          // The handler is registered at the inbound level; the session
-          // and ws are passed through so the registered tools can dispatch
-          // back to esp32 on LLM call.
-          const tools = (payload.result as { tools: Array<{ name: string; description?: string; inputSchema?: unknown }> }).tools;
+          // M3.7.2: register the tool list into the esp32 Tool Registry
+          // so the ChannelAgentToolFactory (createEsp32DeviceToolRouter)
+          // can route LLM tool calls back to this device's WebSocket.
+          const tools = (payload.result as { tools: McpTool[] }).tools;
+          registerEsp32Tools(ctx.deviceId, {
+            tools,
+            ws: ctx.ws,
+            session,
+            lastReportedAt: Date.now(),
+          });
+          log.info(
+            `xiaozhi: ${ctx.deviceId} registered ${tools.length} esp32 tools: ${tools.map((t) => t.name).join(", ")}`,
+          );
+          // Backward compat: also call ctx.onEsp32ToolsList if set.
           if (ctx.onEsp32ToolsList) {
             ctx.onEsp32ToolsList(tools).catch((err: unknown) => {
               log.warn(`xiaozhi: onEsp32ToolsList handler failed: ${(err as Error).message}`);
             });
-          } else {
-            log.info(
-              `xiaozhi: ${ctx.deviceId} received tools/list with ${tools.length} tools (no handler registered — M3.7 wiring pending)`,
-            );
           }
           return;
         }

@@ -36,7 +36,8 @@ import { createXiaozhiConfigAdapter, createXiaozhiConfigSchema } from "./config.
 import { createXiaozhiGatewayAdapter } from "./gateway.js";
 import { createXiaozhiMessagingAdapter } from "./inbound.js";
 import { createXiaozhiOutboundAdapter } from "./outbound.js";
-import { createListDevicesTool } from "./tools.js";
+import { createListDevicesTool, createEsp32DeviceToolRouter } from "./mcp/tools.js";
+import type { ChannelAgentTool } from "openclaw/plugin-sdk/channel-runtime";
 
 const META: ChannelMeta = {
   id: "xiaozhi" as ChannelMeta["id"],
@@ -76,6 +77,12 @@ export function createXiaozhiChannelPlugin(): ChannelPlugin<XiaozhiAccount> {
     streaming: {
       blockStreamingCoalesceDefaults: { minChars: 50, idleMs: 200 },
     } as ChannelStreamingAdapter,
-    agentTools: [createListDevicesTool()],
+    // M3.7.2: agentTools is a ChannelAgentToolFactory (lazy) that
+    // enumerates all currently-registered esp32 devices and exposes
+    // each device's tool list as LLM-callable tools named
+    // `esp32_<deviceId>_<toolName>`. xiaozhi_list_devices stays
+    // static. openclaw calls createEsp32DeviceToolRouter at tool
+    // discovery time, so the tool list updates as devices connect.
+    agentTools: [createListDevicesTool(), createEsp32DeviceToolRouter] as unknown as ChannelAgentTool[],
   };
 }
