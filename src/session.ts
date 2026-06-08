@@ -34,7 +34,7 @@ export interface SessionContext {
   lastActivityAt: number;
 
   // Pending MCP calls (V2 #7 / M3.7)
-  // Map: mcp_request_id (string|number) → Promise resolver
+  // Map: mcp_request_id (string) → Promise resolver
   pendingMcpCalls: Map<string, PendingMcpCall>;
 
   // Audio
@@ -90,22 +90,22 @@ export function drainAudioBuffer(session: SessionContext): Buffer[] {
 /** Add a pending MCP call and return the Promise that resolves when it completes. */
 export function addPendingMcpCall(
   session: SessionContext,
-  requestId: string,
+  requestId: string | number,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    session.pendingMcpCalls.set(requestId, { resolve, reject });
+    session.pendingMcpCalls.set(String(requestId), { resolve, reject });
   });
 }
 
 /** Resolve a pending MCP call (called when esp32 sends a response). */
 export function resolvePendingMcpCall(
   session: SessionContext,
-  requestId: string,
+  requestId: string | number,
   result: unknown,
 ): boolean {
-  const call = session.pendingMcpCalls.get(requestId);
+  const call = session.pendingMcpCalls.get(String(requestId));
   if (!call) return false;
-  session.pendingMcpCalls.delete(requestId);
+  session.pendingMcpCalls.delete(String(requestId));
   call.resolve(result);
   return true;
 }

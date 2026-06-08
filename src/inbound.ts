@@ -13,7 +13,7 @@
  * @see docs/sdk-research-v3.md §3.1 for the 1:1 translation table.
  */
 
-import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelMessagingAdapter, ChannelAgentTool } from "openclaw/plugin-sdk/channel-runtime";
 import type { WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 import type { XiaozhiAccount } from "./config.js";
@@ -35,7 +35,7 @@ import {
   type SessionContext,
 } from "./session.js";
 import type { SessionStore } from "./gateway.js";
-import { sendMcpResponse } from "./mcp/outbound.js";
+import { resolveMcpResponse } from "./mcp/outbound.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
 
 export interface Esp32ConnectionCtx {
@@ -50,6 +50,15 @@ export interface Esp32ConnectionCtx {
     debug: (msg: string, ...args: unknown[]) => void;
   };
   sessionStore: SessionStore;
+  /**
+   * M3.7: invoked when esp32 reports its tool list (MCP tools/list
+   * response). Caller pushes the returned ChannelAgentTool[] into the
+   * openclaw agentTools list. Optional — if absent, the tools are
+   * logged but not exposed to the LLM.
+   */
+  onEsp32ToolsList?: (
+    tools: Array<{ name: string; description?: string; inputSchema?: unknown }>,
+  ) => Promise<ChannelAgentTool[]>;
 }
 
 export function createXiaozhiMessagingAdapter(): ChannelMessagingAdapter {
@@ -312,7 +321,31 @@ async function dispatchClientMessage(
       if (payload.id !== undefined && !payload.method) {
         // Response to a bridge-issued request (M3.7)
         const id = String(payload.id);
-        const ok = sendMcpResponse(session, id, payload);
+        // Distinguish tools/list (MCP handshake) from tools/call (after dispatch).
+        // The bridge only ever sends tools/list during handshake and tools/call
+        // per LLM call, so the cleanest signal is "result has .tools[]".
+        const isToolsList =
+          payload.result !== undefined &&
+          typeof payload.result === "object" &&
+          Array.isArray((payload.result as { tools?: unknown }).tools);
+        if (isToolsList) {
+          // Hand the tool list to the agent-tools pipeline.
+          // The handler is registered at the inbound level; the session
+          // and ws are passed through so the registered tools can dispatch
+          // back to esp32 on LLM call.
+          const tools = (payload.result as { tools: Array<{ name: string; description?: string; inputSchema?: unknown }> }).tools;
+          if (ctx.onEsp32ToolsList) {
+            ctx.onEsp32ToolsList(tools).catch((err: unknown) => {
+              log.warn(`xiaozhi: onEsp32ToolsList handler failed: ${(err as Error).message}`);
+            });
+          } else {
+            log.info(
+              `xiaozhi: ${ctx.deviceId} received tools/list with ${tools.length} tools (no handler registered — M3.7 wiring pending)`,
+            );
+          }
+          return;
+        }
+        const ok = resolveMcpResponse(session, id, payload);
         if (!ok) log.warn(`xiaozhi: received MCP response for unknown id ${id}`);
       } else if (payload.method) {
         // Request from esp32 to bridge (M3.7 — dynamic tool call)
