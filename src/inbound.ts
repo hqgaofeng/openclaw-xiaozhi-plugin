@@ -66,7 +66,7 @@ import { handleEsp32McpRequest } from "./mcp/inbound.js";
 import { registerEsp32Tools, unregisterEsp32Tools } from "./mcp/registry.js";
 import type { McpTool } from "./mcp/protocol.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
-import { startVadWatcher } from "./vad.js";
+import { startVadWatcher, bufferHasSpeech } from "./vad.js";
 
 export interface Esp32ConnectionCtx {
   account: XiaozhiAccount;
@@ -393,6 +393,14 @@ async function deliverLocalReply(
 ): Promise<void> {
   const trimmed = text.trim();
   if (trimmed.length === 0) return;
+  // Bug 2 fix: transition to SPEAKING + send tts.start BEFORE
+  // sendLlmMessage (same as dispatch path). Without this, the
+  // esp32 firmware sees a text-only LLM line, treats it as a
+  // status update, and on the next VAD cycle the wake-word-tail
+  // mic frames get re-dispatched as a second "real" turn — that's
+  // the "wakes up, says reply twice" bug.
+  transitionTo(session, "SPEAKING");
+  sendTtsStart(ctx.ws, ctx.sessionId);
   sendLlmMessage(ctx.ws, ctx.sessionId, undefined, trimmed);
   log.info(
     `xiaozhi: ${ctx.deviceId} local reply: "${trimmed.slice(0, 80)}${trimmed.length > 80 ? "…" : ""}"`,
@@ -405,6 +413,8 @@ async function deliverLocalReply(
     }
   })();
   if (!ttsCfg) {
+    sendTtsStop(ctx.ws, ctx.sessionId);
+    markTtsEnded(session, trimmed, log);
     transitionTo(session, "IDLE");
     return;
   }
@@ -415,6 +425,8 @@ async function deliverLocalReply(
     }
   })();
   if (!tts) {
+    sendTtsStop(ctx.ws, ctx.sessionId);
+    markTtsEnded(session, trimmed, log);
     transitionTo(session, "IDLE");
     return;
   }
@@ -422,11 +434,6 @@ async function deliverLocalReply(
   // Encoder for esp32 TTS audio: 24kHz mono (device output rate,
   // not mic capture rate).
   const encoder = new OpusCodec(24000);
-  // Bug 2: transition to SPEAKING + send tts.start BEFORE
-  // sendLlmMessage so the device enters SPEAKING state cleanly
-  // and the LLM message arrives in the right order.
-  transitionTo(session, "SPEAKING");
-  sendTtsStart(ctx.ws, ctx.sessionId);
   const ttsStart = Date.now();
   try {
     const opusFrames = await streamTtsToOpusFrames(
@@ -467,6 +474,7 @@ async function deliverLocalReply(
     // the TTS pipeline failed. Without this, the next VAD stop would
     // possibly trigger a 2nd identical dispatch.
     markTtsEnded(session, trimmed, log);
+    transitionTo(session, "IDLE");
   }
 }
 
@@ -546,11 +554,24 @@ async function dispatchClientMessage(
                   `xiaozhi: ${ctx.deviceId} VAD stop suppressed — ` +
                   `inside post-TTS grace window (last reply was "${session.lastTtsText?.slice(0, 40)}")`,
                 );
-                // Drain the buffer anyway so we don't accumulate
-                // future echo frames, but skip the ASR+dispatch.
-                drainAudioBuffer(session);
-                transitionTo(session, "IDLE");
-                return;
+                // Bug 5 fix: only suppress if the buffer is empty /
+                // low-energy (echo). If the buffer has real speech
+                // (rms above threshold), the user is actually
+                // talking over the post-TTS echo — let it through.
+                const hasSpeech = bufferHasSpeech(session);
+                if (hasSpeech) {
+                  log.info(
+                    `xiaozhi: ${ctx.deviceId} VAD stop NOT suppressed — ` +
+                    `real speech detected in buffer during grace window`,
+                  );
+                  // Fall through to normal dispatch
+                } else {
+                  // Drain the buffer anyway so we don't accumulate
+                  // future echo frames, but skip the ASR+dispatch.
+                  drainAudioBuffer(session);
+                  transitionTo(session, "IDLE");
+                  return;
+                }
               }
               // Mirror what ListenMessage(stop) would do — drain audio,
               // run ASR, dispatch to LLM, push TTS. handleListenStop

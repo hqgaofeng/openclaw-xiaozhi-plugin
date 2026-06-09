@@ -202,7 +202,7 @@ export function startVadWatcher(opts: VadWatcherOpts): VadWatcher {
  * conservative — prefer false-negatives (missed VAD stop) over false
  * positives (cut user off mid-sentence).
  */
-function computeRms(pcm: Buffer): number {
+export function computeRms(pcm: Buffer): number {
   if (pcm.length < 2) return 0;
   let sum = 0;
   const n = pcm.length / 2;
@@ -211,4 +211,35 @@ function computeRms(pcm: Buffer): number {
     sum += s * s;
   }
   return Math.sqrt(sum / n);
+}
+
+/**
+ * Bug 5 fix: peek into the unprocessed audio buffer and return
+ * true if any frame has RMS above SILENCE_RMS_THRESHOLD.
+ *
+ * Used by the post-TTS grace window to decide whether an
+ * in-grace VAD stop should be suppressed (likely echo) or
+ * dispatched (user is actually talking over the echo).
+ *
+ * Cheap: only decodes the last N frames (not the whole buffer).
+ */
+export function bufferHasSpeech(session: SessionContext): boolean {
+  // Lazy-import-free: instantiate a decoder on the same sample rate
+  // the session is using (16kHz mic).
+  const decoder = new OpusCodec(16000, 1);
+  const buf = session.audioBuffer;
+  // Only look at the last 10 frames (≈600ms of audio) — that's
+  // enough to detect "user is actually talking".
+  const start = Math.max(0, buf.length - 10);
+  for (let i = start; i < buf.length; i++) {
+    try {
+      const pcm = decoder.decode(buf[i]);
+      if (computeRms(pcm) >= SILENCE_RMS_THRESHOLD) {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }

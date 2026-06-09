@@ -109,7 +109,14 @@ export function createSessionContext(
     vadWatcher: null,
     lastTtsText: null,
     lastTtsEndedAt: 0,
-    postTtsGraceMs: 6000, // v0.3.6b: cover VAD max-turn (4s) + slack
+    // Bug 5 fix: was 6000ms (cover VAD max-turn + slack) — too long
+    // for realtime mode where esp32 auto-enters listening after tts.stop.
+    // User speech that starts within 6s gets suppressed by
+    // bufferHasSpeech() = false (only the echo, no real speech yet),
+    // and the session goes to IDLE while the user is mid-utterance.
+    // 1500ms is enough to cover the TTS echo tail (typically <1s)
+    // without choking off natural back-and-forth conversation.
+    postTtsGraceMs: 1500,
     aborted: false,        // v0.3.7: no in-flight TTS to cancel yet
   };
 }
