@@ -78,6 +78,13 @@ export interface SessionContext {
   lastTtsEndedAt: number;
   /** Window after TTS end during which mic input is treated as echo. */
   postTtsGraceMs: number;
+
+  // v0.3.7 (Bug 3 fix): in-flight TTS abort flag. When esp32 sends an
+  // `abort` message, the inbound handler sets this to true. The
+  // streamTtsToOpusFrames loop checks it on every chunk and breaks
+  // early — preventing late TTS audio from reaching the device after
+  // the user has already interrupted. Cleared on next Listen.start.
+  aborted: boolean;
 }
 
 export function createSessionContext(
@@ -103,6 +110,7 @@ export function createSessionContext(
     lastTtsText: null,
     lastTtsEndedAt: 0,
     postTtsGraceMs: 6000, // v0.3.6b: cover VAD max-turn (4s) + slack
+    aborted: false,        // v0.3.7: no in-flight TTS to cancel yet
   };
 }
 

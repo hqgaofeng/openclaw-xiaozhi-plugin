@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import type { XiaozhiAccount } from "./config.js";
 import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/channel-inbound";
 import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig } from "./api.js";
-import { sendSttMessage, sendLlmMessage, sendTtsAudio } from "./outbound.js";
+import { sendSttMessage, sendLlmMessage, sendTtsStart, sendTtsSentenceStart, sendTtsOpusFrames, sendTtsStop, sendTtsAudio } from "./outbound.js";
 import { getTTSProvider } from "./tts/index.js";
 import { OpusCodec } from "./audio.js";
 // M3.7.3: borrow the same TTS→opus streaming helper that handleListenStop
@@ -62,6 +62,7 @@ import {
 } from "./session.js";
 import type { SessionStore } from "./gateway.js";
 import { resolveMcpResponse } from "./mcp/outbound.js";
+import { handleEsp32McpRequest } from "./mcp/inbound.js";
 import { registerEsp32Tools, unregisterEsp32Tools } from "./mcp/registry.js";
 import type { McpTool } from "./mcp/protocol.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
@@ -289,19 +290,40 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
         // Drop silently — this is echo of our own TTS, not user speech.
         return;
       }
-      // We still respect the state machine for *transitions*: if we're
-      // in IDLE and audio is arriving, the firmware is entering a listen
-      // turn — auto-promote to LISTENING so handleListenStop can find
-      // the frames when ListenMessage(stop) arrives.
+      // M5 fix: detect wake-word-tail frame bursts. The esp32 firmware
+      // pushes 35 wake-word opus frames in ~232ms before sending the
+      // ListenMessage(detect) text. If we see more than, say, 5
+      // consecutive frames without ever seeing a listen.start, this is
+      // almost certainly the wake-word tail — the listen.start we
+      // expect is the detect one, which carries text not opus.
       if (session.state === "IDLE") {
         transitionTo(session, "LISTENING");
-        log.info(`xiaozhi: ${ctx.deviceId} auto-transition IDLE→LISTENING on first opus frame`);
+        log.info(
+          `xiaozhi: ${ctx.deviceId} auto-transition IDLE→LISTENING on first opus frame ` +
+          `(${event.data.length} bytes; state was IDLE for ${
+            Date.now() - session.lastActivityAt
+          }ms)`,
+        );
+      } else if (session.state !== "LISTENING") {
+        // Should be unreachable: every other state is handled above.
+        // Log loudly so we catch a future code path that introduces
+        // a new state and forgets to update this gate.
+        log.warn(
+          `xiaozhi: ${ctx.deviceId} opus frame arrived in unexpected state=${session.state} ` +
+          `(dropping; lastActivityAt was ${
+            Date.now() - session.lastActivityAt
+          }ms ago)`,
+        );
+        return;
       }
       appendAudioFrame(session, asBinaryData(event));
       // M3.7.3 debug: log first frame + every 50th to confirm consumption
       const total = session.audioBuffer.length;
       if (total === 1 || total % 50 === 0) {
-        log.info(`xiaozhi: ${ctx.deviceId} opus frame #${total} (${event.data.length} bytes)`);
+        log.info(
+          `xiaozhi: ${ctx.deviceId} opus frame #${total} (${event.data.length} bytes, ` +
+          `state=${session.state}, codec=${(session.codec as { sampleRate?: number }).sampleRate ?? "?"}Hz)`,
+        );
       }
     }
   }
@@ -400,7 +422,11 @@ async function deliverLocalReply(
   // Encoder for esp32 TTS audio: 24kHz mono (device output rate,
   // not mic capture rate).
   const encoder = new OpusCodec(24000);
+  // Bug 2: transition to SPEAKING + send tts.start BEFORE
+  // sendLlmMessage so the device enters SPEAKING state cleanly
+  // and the LLM message arrives in the right order.
   transitionTo(session, "SPEAKING");
+  sendTtsStart(ctx.ws, ctx.sessionId);
   const ttsStart = Date.now();
   try {
     const opusFrames = await streamTtsToOpusFrames(
@@ -413,6 +439,7 @@ async function deliverLocalReply(
         error: (m: string, ...a: unknown[]) => log.error(m, ...a),
         debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
       } as never,
+      session,
     );
     const ttsMs = Date.now() - ttsStart;
     log.info(
@@ -420,12 +447,25 @@ async function deliverLocalReply(
       `(${(trimmed.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
     );
     if (opusFrames.length > 0) {
-      sendTtsAudio(ctx.ws, ctx.sessionId, trimmed, opusFrames);
+      // Bug 1+2 fix: text already delivered as LLM message; now send
+      // sentence_start + frames + stop in the correct order.
+      sendTtsSentenceStart(ctx.ws, ctx.sessionId, trimmed);
+      sendTtsOpusFrames(ctx.ws, opusFrames);
+      sendTtsStop(ctx.ws, ctx.sessionId);
+    } else {
+      // Edge: no frames produced — still need tts.stop to exit SPEAKING.
+      sendTtsStop(ctx.ws, ctx.sessionId);
     }
   } catch (ttsErr) {
     log.error(`xiaozhi: ${ctx.deviceId} TTS encode failed:`, (ttsErr as Error).message);
+    // Bug 1 fix: send tts.stop so device doesn't stay in SPEAKING
+    try {
+      sendTtsStop(ctx.ws, ctx.sessionId);
+    } catch { /* ignore */ }
   } finally {
-    transitionTo(session, "IDLE");
+    // markTtsEnded activates the post-TTS echo grace window even when
+    // the TTS pipeline failed. Without this, the next VAD stop would
+    // possibly trigger a 2nd identical dispatch.
     markTtsEnded(session, trimmed, log);
   }
 }
@@ -456,6 +496,12 @@ async function dispatchClientMessage(
           );
           return;
         }
+        // Bug 3 fix: clear the aborted flag so a brand-new listen turn
+        // can produce fresh TTS audio. (Without this, an abort that
+        // landed in the middle of a previous TTS synthesis would leave
+        // the flag set, causing the next TTS to bail out at the first
+        // chunk — device would play silence for the new turn.)
+        session.aborted = false;
         // M3.2 stub: just record the start; full audio dispatch lands in M3.4
         // when we have the openclaw channelRuntime wired in.
         transitionTo(session, "LISTENING");
@@ -667,6 +713,12 @@ async function dispatchClientMessage(
               const encoderSampleRate = 24000 as const;
               const encoder = new OpusCodec(encoderSampleRate);
               void sampleRate;
+              // Bug 2: transition + tts.start BEFORE LLM message
+              transitionTo(session, "SPEAKING");
+              sendTtsStart(ctx.ws, ctx.sessionId);
+              // Send LLM message AFTER tts.start so the esp32 display
+              // doesn't briefly show a text-only LLM line
+              sendLlmMessage(ctx.ws, ctx.sessionId, undefined, text);
               const ttsStart = Date.now();
               try {
                 const opusFrames = await streamTtsToOpusFrames(
@@ -679,6 +731,7 @@ async function dispatchClientMessage(
                     error: (m: string, ...a: unknown[]) => log.error(m, ...a),
                     debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
                   } as never,
+                  session,
                 );
                 const ttsMs = Date.now() - ttsStart;
                 log.info(
@@ -686,17 +739,22 @@ async function dispatchClientMessage(
                   `(${(text.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
                 );
                 if (opusFrames.length > 0) {
-                  sendTtsAudio(ctx.ws, ctx.sessionId, text, opusFrames);
+                  sendTtsSentenceStart(ctx.ws, ctx.sessionId, text);
+                  sendTtsOpusFrames(ctx.ws, opusFrames);
                 }
+                sendTtsStop(ctx.ws, ctx.sessionId);
                 // v0.3.6: mark TTS ended so the post-TTS echo grace
                 // window activates. Without this, the next VAD stop
                 // dispatches a 2nd identical reply to the agent loop.
                 markTtsEnded(session, text, log);
               } catch (err) {
                 log.error(`xiaozhi: ${ctx.deviceId} TTS failed: ${(err as Error).message}`);
-                // TTS failed but text was already delivered — esp32 will
-                // still see the LLM message on its display. Device just
-                // won't play audio.
+                // Bug 1 fix: ensure tts.stop is sent + grace window
+                // activated even when TTS fails.
+                try {
+                  sendTtsStop(ctx.ws, ctx.sessionId);
+                } catch { /* ignore */ }
+                markTtsEnded(session, text, log);
               }
             },
             onRecordError: (err) => log.error(`xiaozhi: record error:`, err),
@@ -715,7 +773,19 @@ async function dispatchClientMessage(
     }
 
     case "abort": {
+      // Bug 3 fix: set the aborted flag so any in-flight TTS synthesis
+      // (running in the deliver callback's streamTtsToOpusFrames loop)
+      // breaks out early on the next chunk. The deliver callback's
+      // finally block (markTtsEnded + tts.stop) will still run and
+      // ensure the device cleanly exits SPEAKING state.
       log.info(`xiaozhi: ${ctx.deviceId} abort (${msg.reason ?? "no reason"})`);
+      session.aborted = true;
+      // Tear down the VAD watcher — we don't want a queued silence
+      // detection to fire after the user has explicitly aborted.
+      if (session.vadWatcher) {
+        session.vadWatcher.stop();
+        session.vadWatcher = null;
+      }
       transitionTo(session, "IDLE");
       return;
     }
@@ -758,9 +828,18 @@ async function dispatchClientMessage(
         const ok = resolveMcpResponse(session, id, payload);
         if (!ok) log.warn(`xiaozhi: received MCP response for unknown id ${id}`);
       } else if (payload.method) {
-        // Request from esp32 to bridge (M3.7 — dynamic tool call)
-        log.info(`xiaozhi: ${ctx.deviceId} mcp request: ${payload.method}`);
-        // M3.7: forward to openclaw agent tool router
+        // v0.3.7 (M4 fix): Request from esp32 → dispatch to openclaw
+        // agent tool router via mcp/inbound.ts handleEsp32McpRequest.
+        // Supports both "tools/list" (return openclaw tool catalog)
+        // and "tools/call" (execute a named tool, return result).
+        try {
+          await handleEsp32McpRequest(ctx.ws, session, msg as never, log);
+        } catch (err) {
+          log.error(
+            `xiaozhi: ${ctx.deviceId} mcp request ${payload.method} failed:`,
+            (err as Error).message,
+          );
+        }
       }
       return;
     }

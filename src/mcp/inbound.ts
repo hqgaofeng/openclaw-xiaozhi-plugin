@@ -28,9 +28,14 @@ import {
   toOpenAiFunctionShape,
   type McpTool,
   type JsonRpcResponse,
+  type JsonRpcRequest,
   isJsonRpcResponse,
   isJsonRpcError,
 } from "./protocol.js";
+import {
+  serializeServerMessage,
+  type ServerMessage,
+} from "../protocol.js";
 
 /** Adapter that wraps an esp32 tool as an openclaw agent tool. */
 export function createEsp32ToolAdapter(
@@ -190,4 +195,176 @@ export function handleMcpResponse(
   // tools/call response — resolve the pending future with the result.
   resolveMcpResponse(session, response.id, { result: response.result });
   return null;
+}
+
+/**
+ * v0.3.7 (M4 fix): reverse MCP channel — esp32 → openclaw tool router.
+ *
+ * When the esp32 device sends an MCP JSON-RPC 2.0 *request* (not a
+ * response), it expects the openclaw side to dispatch the tool call
+ * to a registered agent tool. This is symmetric to the existing
+ * server→esp32 path in sendMcpCall().
+ *
+ * Two methods handled:
+ *   - "tools/list"  → return list of available openclaw agent tools
+ *                     formatted as MCP McpTool[]
+ *   - "tools/call"  → look up the tool in the openclaw agent registry,
+ *                     execute it, return the result (or error)
+ *
+ * Response format follows the same JSON-RPC 2.0 envelope the esp32
+ * would normally see for its own outbound tools/call. The session_id
+ * wrapper follows the xiaozhi protocol convention.
+ */
+export interface OpenClawAgentTool {
+  name: string;
+  description?: string;
+  inputSchema?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
+  execute: (params: Record<string, unknown>) => Promise<{
+    content: Array<
+      | { type: "text"; text: string }
+      | { type: "image"; data: string; mimeType: string }
+    >;
+    isError?: boolean;
+  }>;
+}
+
+/**
+ * Provider of the *current* openclaw agent tool list. Recomputed on
+ * every call so newly-registered esp32 devices show up immediately.
+ *
+ * Default: a no-op empty list. The real provider is installed by
+ * plugin-xiaozhi.ts at module-load time using setOpenClawAgentToolsProvider.
+ */
+let toolsProvider: () => OpenClawAgentTool[] = () => [];
+
+export function setOpenClawAgentToolsProvider(
+  provider: () => OpenClawAgentTool[],
+): void {
+  toolsProvider = provider;
+}
+
+/** Snapshot the current openclaw agent tool list (re-resolved each call). */
+export function getOpenClawAgentTools(): OpenClawAgentTool[] {
+  return toolsProvider();
+}
+
+/** Send a JSON-RPC 2.0 success response to esp32. */
+export function sendMcpResponse(
+  ws: WebSocket,
+  sessionId: string,
+  id: number | string,
+  result: unknown,
+): void {
+  const msg = {
+    type: "mcp" as const,
+    session_id: sessionId,
+    payload: {
+      jsonrpc: "2.0" as const,
+      id,
+      result,
+    },
+  };
+  ws.send(serializeServerMessage(msg as unknown as ServerMessage));
+}
+
+/** Send a JSON-RPC 2.0 error response to esp32. */
+export function sendMcpError(
+  ws: WebSocket,
+  sessionId: string,
+  id: number | string,
+  code: number,
+  message: string,
+  data?: unknown,
+): void {
+  const msg = {
+    type: "mcp" as const,
+    session_id: sessionId,
+    payload: {
+      jsonrpc: "2.0" as const,
+      id,
+      error: { code, message, ...(data !== undefined ? { data } : {}) },
+    },
+  };
+  ws.send(serializeServerMessage(msg as unknown as ServerMessage));
+}
+
+/**
+ * Dispatch a JSON-RPC 2.0 request from esp32 to an openclaw agent tool.
+ *
+ * Tools are looked up by `params.name` in the registered openclaw
+ * tool list. If not found, returns a JSON-RPC error with code
+ * -32601 (Method not found).
+ */
+export async function handleEsp32McpRequest(
+  ws: WebSocket,
+  session: SessionContext,
+  request: JsonRpcRequest,
+  log: {
+    info: (msg: string, ...args: unknown[]) => void;
+    warn: (msg: string, ...args: unknown[]) => void;
+    error: (msg: string, ...args: unknown[]) => void;
+  },
+): Promise<void> {
+  const { id, method, params } = request;
+  log.info(
+    `xiaozhi: ${session.deviceId} mcp request: method=${method}, id=${id}`,
+  );
+
+  // Validate id (JSON-RPC requires id in request).
+  if (id === undefined || id === null) {
+    log.warn(`xiaozhi: ${session.deviceId} mcp request without id, dropping`);
+    return;
+  }
+
+  if (method === "tools/list") {
+    // v0.3.7: convert openclaw tool list to MCP McpTool shape.
+    const tools = getOpenClawAgentTools();
+    const mcpTools: McpTool[] = tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    }));
+    sendMcpResponse(ws, session.sessionId, id, { tools: mcpTools });
+    log.info(
+      `xiaozhi: ${session.deviceId} tools/list served ${mcpTools.length} tools: ${mcpTools.map((t) => t.name).join(", ")}`,
+    );
+    return;
+  }
+
+  if (method === "tools/call") {
+    // v0.3.7: dispatch to a registered openclaw agent tool.
+    const callParams = (params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
+    const toolName = callParams.name;
+    if (typeof toolName !== "string" || toolName.length === 0) {
+      sendMcpError(ws, session.sessionId, id, -32602, "params.name must be a non-empty string");
+      return;
+    }
+    const args = callParams.arguments ?? {};
+    const tool = getOpenClawAgentTools().find((t) => t.name === toolName);
+    if (!tool) {
+      sendMcpError(ws, session.sessionId, id, -32601, `tool '${toolName}' not found in openclaw registry`);
+      log.warn(`xiaozhi: ${session.deviceId} requested unknown tool '${toolName}'`);
+      return;
+    }
+    try {
+      const out = await tool.execute(args);
+      sendMcpResponse(ws, session.sessionId, id, {
+        content: out.content,
+        ...(out.isError ? { isError: out.isError } : {}),
+      });
+      log.info(
+        `xiaozhi: ${session.deviceId} tool '${toolName}' executed, ` +
+        `${out.content.length} content blocks, isError=${out.isError ?? false}`,
+      );
+    } catch (err) {
+      const e = err as Error;
+      sendMcpError(ws, session.sessionId, id, -32603, `tool execution failed: ${e.message}`);
+      log.error(`xiaozhi: ${session.deviceId} tool '${toolName}' threw:`, e.message);
+    }
+    return;
+  }
+
+  // Unknown method — JSON-RPC standard error -32601.
+  sendMcpError(ws, session.sessionId, id, -32601, `method '${method}' not supported`);
+  log.warn(`xiaozhi: ${session.deviceId} unknown mcp method '${method}'`);
 }

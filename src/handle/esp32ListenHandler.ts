@@ -21,11 +21,12 @@ import {
 import type { XiaozhiAccount } from "../config.js";
 import { getASRProvider, ASRError } from "../asr/index.js";
 import { getTTSProvider, TTSError } from "../tts/index.js";
-import { sendSttMessage, sendLlmMessage, sendTtsAudio } from "../outbound.js";
+import { sendSttMessage, sendLlmMessage, sendTtsStart, sendTtsSentenceStart, sendTtsOpusFrames, sendTtsStop } from "../outbound.js";
 import { OpusCodec, frameSizeBytes } from "../audio.js";
 import {
   drainAudioBuffer,
   isInPostTtsGrace,
+  markTtsEnded,
   transitionTo,
   type SessionContext,
 } from "../session.js";
@@ -71,12 +72,37 @@ export async function handleListenStop(
 
   // 1. Drain audio buffer
   const opusFrames = drainAudioBuffer(session);
+
+  // M6 fix: assert state === LISTENING here. The esp32 firmware
+  // is supposed to send listen.stop only after a matching
+  // listen.start, but in practice we sometimes see listen.stop
+  // arrive out of order (e.g. right after a tts.stop) — the
+  // previous code happily drained a (probably empty) buffer and
+  // went on, masking state-machine bugs. Log loudly so we catch
+  // them in tests.
+  const stateOnStop = session.state;
+  if (stateOnStop !== "LISTENING") {
+    log.warn(
+      `xiaozhi: ${ctx.deviceId} listen stop arrived in unexpected state=${stateOnStop} ` +
+      `(frames=${opusFrames.length}, lastActivity=${
+        Date.now() - session.lastActivityAt
+      }ms ago, lastTts="${session.lastTtsText?.slice(0, 40) ?? ""}")`,
+    );
+    // Don't bail — the device may be coming out of a tts stop and
+    // the user might still be talking. Just don't try to dispatch
+    // an empty / spurious buffer downstream.
+    if (opusFrames.length === 0) {
+      transitionTo(session, "IDLE");
+      return;
+    }
+  }
+
   if (opusFrames.length === 0) {
     log.warn(`xiaozhi: ${ctx.deviceId} listen stop with empty audio buffer`);
     transitionTo(session, "IDLE");
     return;
   }
-  log.info(`xiaozhi: ${ctx.deviceId} listen stop: ${opusFrames.length} opus frames`);
+  log.info(`xiaozhi: ${ctx.deviceId} listen stop: ${opusFrames.length} opus frames (state was ${stateOnStop})`);
 
   // 2. Opus decode → PCM int16 16kHz mono
   const decoderCodec = session.codec.sampleRate === 16000
@@ -160,31 +186,58 @@ export async function handleListenStop(
           return;
         }
 
-        // 1. Send LLM message (text + emotion) for esp32 display
+        // 1. Transition to SPEAKING FIRST so any concurrent mic frames
+        //    arriving during the TTS pipeline get dropped (they're speaker
+        //    echo, not user speech).
+        transitionTo(session, "SPEAKING");
+
+        // 2. Send tts.start BEFORE sendLlmMessage so the esp32 display
+        //    knows we're entering a TTS turn. esp32 firmware validates
+        //    the tts.state sequence and ignores LLM messages that arrive
+        //    before tts.start.
+        sendTtsStart(ctx.ws, ctx.sessionId);
+
+        // 3. Send LLM message (text + emotion) for esp32 display
         sendLlmMessage(ctx.ws, ctx.sessionId, undefined, replyText);
         log.info(
           `xiaozhi: ${ctx.deviceId} llm reply: "${replyText.slice(0, 80)}${replyText.length > 80 ? "…" : ""}"`,
         );
 
-        // 2. TTS pipeline (M3.4d): stream reply text → PCM chunks → opus frames
-        if (!tts) return;
-        transitionTo(session, "SPEAKING");
+        // 4. TTS pipeline: stream reply text → PCM chunks → opus frames
+        //    Then send sentence_start (with text), frames, tts.stop.
+        //    The markTtsEnded() call in finally activates the post-TTS
+        //    echo grace window even if the TTS encoding throws.
+        if (!tts) {
+          // No TTS provider — still need to send tts.stop so the device
+          // exits SPEAKING state. markTtsEnded so echo suppression works.
+          sendTtsStop(ctx.ws, ctx.sessionId);
+          markTtsEnded(session, replyText, log);
+          return;
+        }
         const ttsStart = Date.now();
+        let opusFrames: Buffer[] = [];
         try {
-          const opusFrames = await streamTtsToOpusFrames(tts, replyText, ttsEncoder, log);
+          opusFrames = await streamTtsToOpusFrames(tts, replyText, ttsEncoder, log, session);
           const ttsMs = Date.now() - ttsStart;
           log.info(
             `xiaozhi: ${ctx.deviceId} tts ${ttsMs}ms → ${opusFrames.length} opus frames ` +
             `(${(replyText.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
           );
-          sendTtsAudio(ctx.ws, ctx.sessionId, replyText, opusFrames);
+          sendTtsSentenceStart(ctx.ws, ctx.sessionId, replyText);
+          sendTtsOpusFrames(ctx.ws, opusFrames);
+          sendTtsStop(ctx.ws, ctx.sessionId);
         } catch (err) {
           const e = err as TTSError;
           log.error(`xiaozhi: ${ctx.deviceId} TTS failed:`, e.message);
-          // TTS failed but text was already delivered — esp32 will still see
-          // the LLM message on its display. Device just won't play audio.
+          // Bug 1 fix: still send tts.stop so device doesn't stay in
+          // SPEAKING forever, and markTtsEnded so the post-TTS grace
+          // window activates (otherwise the next VAD stop will treat
+          // the silence as a new turn and possibly echo-trigger).
+          try {
+            sendTtsStop(ctx.ws, ctx.sessionId);
+          } catch { /* ignore */ }
         } finally {
-          transitionTo(session, "IDLE");
+          markTtsEnded(session, replyText, log);
         }
       },
       onRecordError: (err) => log.error(`xiaozhi: record error:`, err),
@@ -212,25 +265,49 @@ function decodeOpusFrames(opusFrames: Buffer[], codec: OpusCodec): Buffer {
  * Buffers PCM until we have at least one full 60ms frame, then opus-encodes
  * and emits. The TTS provider yields chunks continuously; we accumulate to
  * 60ms boundaries to keep the esp32 frame count deterministic.
+ *
+ * v0.3.7 (Bug 3 fix): if session.aborted is set (by an in-flight abort
+ * from the device), the loop breaks early so late TTS audio doesn't
+ * reach the device after the user interrupted.
  */
 export async function streamTtsToOpusFrames(
   tts: ReturnType<typeof getTTSProvider>,
   text: string,
   encoder: OpusCodec,
   log: ListenStopCtx["log"],
+  session: SessionContext,
 ): Promise<Buffer[]> {
   const frameBytes = frameSizeBytes(24000);
   let pending: Buffer = Buffer.alloc(0);
   const opusFrames: Buffer[] = [];
   let firstChunkSeen = false;
+  let aborted = false;
 
   for await (const chunk of tts.synthesize(text)) {
+    // Bug 3 fix: bail out of the loop on abort. The deliver callback's
+    // finally block (markTtsEnded + tts.stop) still runs, but we stop
+    // synthesizing new audio and stop sending frames.
+    if (session.aborted) {
+      log.info(
+        `xiaozhi: ${session.deviceId} TTS stream aborted mid-synthesis ` +
+        `(${opusFrames.length} frames emitted before abort)`,
+      );
+      aborted = true;
+      break;
+    }
     if (chunk.pcm.length === 0) continue;
     firstChunkSeen = true;
     pending = Buffer.concat([pending, chunk.pcm]);
 
     // Emit complete 60ms frames
     while (pending.length >= frameBytes) {
+      // Re-check abort before each encode (the synthesize iterator
+      // yields chunks asynchronously, so a device abort could land
+      // between two encode calls).
+      if (session.aborted) {
+        aborted = true;
+        break;
+      }
       const frame = pending.subarray(0, frameBytes);
       pending = pending.subarray(frameBytes);
       try {
@@ -239,10 +316,11 @@ export async function streamTtsToOpusFrames(
         log.warn(`xiaozhi: opus encode failed: ${(err as Error).message}`);
       }
     }
+    if (aborted) break;
   }
 
   // Pad the last partial frame to 60ms with silence
-  if (firstChunkSeen && pending.length > 0) {
+  if (!aborted && firstChunkSeen && pending.length > 0) {
     const padded = Buffer.alloc(frameBytes);
     pending.copy(padded, 0, 0, Math.min(pending.length, frameBytes));
     try {

@@ -56,6 +56,40 @@ export function sendTtsAudio(
   ws.send(serializeServerMessage({ type: "tts", session_id: sessionId, state: "stop" }));
 }
 
+/**
+ * Bug 2 fix + v0.3.6b: split sendTtsAudio into 3 separate senders so the
+ * call site can:
+ *   1. send tts.start FIRST (BEFORE sendLlmMessage) so the esp32
+ *      display doesn't briefly show a text-only LLM line
+ *   2. send sentence_start (with text) + frames (potentially async)
+ *   3. send tts.stop + markTtsEnded (in finally) so the post-TTS echo
+ *      grace window activates even when TTS encoding fails
+ */
+export function sendTtsStart(ws: WebSocket, sessionId: string): void {
+  ws.send(serializeServerMessage({ type: "tts", session_id: sessionId, state: "start" }));
+}
+
+export function sendTtsSentenceStart(ws: WebSocket, sessionId: string, text: string): void {
+  ws.send(
+    serializeServerMessage({
+      type: "tts",
+      session_id: sessionId,
+      state: "sentence_start",
+      text,
+    }),
+  );
+}
+
+export function sendTtsOpusFrames(ws: WebSocket, opusFrames: Buffer[]): void {
+  for (const frame of opusFrames) {
+    ws.send(frame, { binary: true });
+  }
+}
+
+export function sendTtsStop(ws: WebSocket, sessionId: string): void {
+  ws.send(serializeServerMessage({ type: "tts", session_id: sessionId, state: "stop" }));
+}
+
 /** Send System command (e.g. reboot after OTA). */
 export function sendSystemCommand(ws: WebSocket, sessionId: string, command: string): void {
   ws.send(serializeServerMessage({ type: "system", session_id: sessionId, command }));
