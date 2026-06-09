@@ -131,8 +131,19 @@ export async function handleOtaRequest(
   }
 
   if (device.mac_address || device.board) {
+    // M3.7.3: device.board from the xiaozhi-esp32 firmware is a nested
+    // JSON object (e.g. {type: "my-custom-wifi-lcd", ...}) rather than
+    // a plain string. Without JSON.stringify it logged as
+    // "board=[object Object]" which made it impossible to tell which
+    // board we were actually being called by.
+    const boardDesc =
+      typeof device.board === "string"
+        ? device.board
+        : device.board != null
+        ? JSON.stringify(device.board)
+        : "unknown";
     console.log(
-      `[xiaozhi.ota] check from board=${device.board ?? "unknown"} ` +
+      `[xiaozhi.ota] check from board=${boardDesc} ` +
         `mac=${device.mac_address ?? "unknown"} ` +
         `flash=${device.flash_size ?? "?"} → ${OTA_WEBSOCKET_URL}`,
     );

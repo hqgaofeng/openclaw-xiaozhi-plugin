@@ -45,6 +45,39 @@ export interface SessionContext {
   vad: unknown;               // SileroVAD instance (or null if not enabled)
   /** VAD disabled until this timestamp (wake word tail buffer). */
   wakeGraceUntil: number;
+
+  // M3.7.3 server-side VAD: track listen mode from esp32's listen.start
+  // and run our own VAD when the device pushes a non-manual mode (esp32
+  // firmware in CONFIG_USE_DEVICE_AEC=y mode never sends a listen.stop
+  // — it waits for either a wake word interrupt or a touch key, both of
+  // which leave the user stuck in "listening" if they want a back-and-
+  // forth). The official xiaozhi-esp32-server (core/handle/receiveAudioHandle.py
+  // + core/providers/vad/silero.py) runs a silero VAD on every audio
+  // frame and uses a 1s-silence threshold to trigger a voice-stop — the
+  // ASR layer then triggers the rest of the pipeline. We mirror that
+  // here with a much simpler RMS-energy VAD (no onnx runtime needed).
+  /** Listen mode from listen.start message: "auto" | "manual" | "realtime". */
+  clientListenMode: "auto" | "manual" | "realtime" | null;
+  /** Active VadWatcher (started when LISTENING in non-manual mode). */
+  vadWatcher: { stop: () => void } | null;
+
+  // v0.3.6: TTS echo suppression (mirrors xiaozhi-esp32-server
+  //   _should_ignore_audio_while_speaking + frogchou's
+  //   _speak_grace_until). Without AEC on the device, the esp32
+  //   mic re-captures the TTS audio we just sent, the VAD fires
+  //   on the echo, ASR returns garbage, and the agent loop is
+  //   dispatched a 2nd time on the same wake word.
+  //
+  //   The fix is two-layered:
+  //   1. While isSpeaking (TTS in flight): drop mic frames in
+  //      inbound.ts binary handler (already done in M3.7.3.1).
+  //   2. After TTS ends: set lastTtsEndedAt + lastTtsText. For
+  //      POST_TTS_GRACE_MS (default 2000ms) after TTS stop, the
+  //      VAD watcher + ASR echo-detection both suppress dispatches.
+  lastTtsText: string | null;
+  lastTtsEndedAt: number;
+  /** Window after TTS end during which mic input is treated as echo. */
+  postTtsGraceMs: number;
 }
 
 export function createSessionContext(
@@ -65,7 +98,43 @@ export function createSessionContext(
     codec,
     vad: null,
     wakeGraceUntil: 0,
+    clientListenMode: null,
+    vadWatcher: null,
+    lastTtsText: null,
+    lastTtsEndedAt: 0,
+    postTtsGraceMs: 6000, // v0.3.6b: cover VAD max-turn (4s) + slack
   };
+}
+
+/**
+ * v0.3.6: mark a TTS push as just-completed. Call this in the
+ * TTS pipeline's finally block so subsequent VAD stop / ASR
+ * dispatches know the audio is in the post-TTS echo window.
+ */
+export function markTtsEnded(
+  session: SessionContext,
+  text: string,
+  log?: { info: (msg: string, ...args: unknown[]) => void },
+): void {
+  session.lastTtsText = text;
+  session.lastTtsEndedAt = Date.now();
+  if (log) {
+    log.info(
+      `xiaozhi: ${session.deviceId} TTS ended, post-grace window ` +
+      `${session.postTtsGraceMs}ms active until ` +
+      `${new Date(session.lastTtsEndedAt + session.postTtsGraceMs).toISOString().slice(11, 19)}`,
+    );
+  }
+}
+
+/**
+ * v0.3.6: returns true if we are inside the post-TTS echo grace
+ * window. Callers (VAD watcher stop, ASR echo detector) use this
+ * to decide whether to drop the current mic input as echo.
+ */
+export function isInPostTtsGrace(session: SessionContext): boolean {
+  if (session.lastTtsEndedAt === 0) return false;
+  return Date.now() - session.lastTtsEndedAt < session.postTtsGraceMs;
 }
 
 /** Transition to a new state, updating lastActivityAt. */
@@ -119,6 +188,12 @@ export function cleanupSession(session: SessionContext): void {
   for (const [id, call] of session.pendingMcpCalls.entries()) {
     call.reject(new Error("session_disconnected"));
     session.pendingMcpCalls.delete(id);
+  }
+  // M3.7.3: stop our server-side VAD watcher (if any) so we don't
+  // leave a setInterval running after the device disconnects.
+  if (session.vadWatcher) {
+    session.vadWatcher.stop();
+    session.vadWatcher = null;
   }
   session.audioBuffer = [];
 }

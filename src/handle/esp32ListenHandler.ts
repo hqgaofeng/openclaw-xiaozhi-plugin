@@ -25,6 +25,7 @@ import { sendSttMessage, sendLlmMessage, sendTtsAudio } from "../outbound.js";
 import { OpusCodec, frameSizeBytes } from "../audio.js";
 import {
   drainAudioBuffer,
+  isInPostTtsGrace,
   transitionTo,
   type SessionContext,
 } from "../session.js";
@@ -53,6 +54,20 @@ export async function handleListenStop(
   session: SessionContext,
 ): Promise<void> {
   const { log } = ctx;
+
+  // v0.3.6: post-TTS echo suppression. esp32's mic re-captures the
+  // TTS audio we just sent (no AEC on the device side). Without
+  // this guard, ASR returns garbled echo, the agent loop is
+  // dispatched, and the user hears the same reply twice.
+  if (isInPostTtsGrace(session)) {
+    log.info(
+      `xiaozhi: ${ctx.deviceId} listen stop suppressed — ` +
+      `inside post-TTS grace window (last reply was "${session.lastTtsText?.slice(0, 40)}")`,
+    );
+    drainAudioBuffer(session);
+    transitionTo(session, "IDLE");
+    return;
+  }
 
   // 1. Drain audio buffer
   const opusFrames = drainAudioBuffer(session);
@@ -198,7 +213,7 @@ function decodeOpusFrames(opusFrames: Buffer[], codec: OpusCodec): Buffer {
  * and emits. The TTS provider yields chunks continuously; we accumulate to
  * 60ms boundaries to keep the esp32 frame count deterministic.
  */
-async function streamTtsToOpusFrames(
+export async function streamTtsToOpusFrames(
   tts: ReturnType<typeof getTTSProvider>,
   text: string,
   encoder: OpusCodec,

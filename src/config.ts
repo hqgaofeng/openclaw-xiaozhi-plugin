@@ -44,6 +44,22 @@ export interface XiaozhiAccount {
     provider: "mock" | "edge" | "minimax" | "cloud";
     options?: Record<string, unknown>;
   };
+
+  // v0.3.5: wake-word short-circuit (mirrors official xiaozhi-esp32-server
+  //   core/handle/textHandler/listenMessageHandler.py: when the esp32
+  //   AFE detects one of these phrases, the official backend
+  //   - sends STT echo for display,
+  //   - replies with a fixed greeting ("嘿，你好呀") instead of
+  //     dispatching to the LLM, OR
+  //   - sends tts=stop and skips the reply entirely if enable_greeting=false.
+  //   This prevents the "every wake-up says the same reply twice" symptom
+  //   we were seeing (plugin previously dispatched the wake word to the
+  //   agent loop, which always answered "我是贾维斯" — and the esp32 mic
+  //   picked up the TTS echo on the next VAD cycle, triggering a second
+  //   identical reply).
+  wakeupWords?: string[];
+  enableGreeting?: boolean;
+  greeting?: string;
 }
 
 export interface XiaozhiConfig {
@@ -65,6 +81,11 @@ export interface XiaozhiConfig {
     provider: "mock" | "edge" | "minimax" | "cloud";
     options?: Record<string, unknown>;
   };
+
+  // v0.3.5: wake-word short-circuit
+  wakeupWords?: string[];
+  enableGreeting?: boolean;
+  greeting?: string;
 }
 
 export const DEFAULT_CONFIG: Omit<XiaozhiConfig, "accountId"> = {
@@ -106,6 +127,17 @@ export function readXiaozhiConfig(raw: unknown): XiaozhiConfig {
     sessionIdPrefix: typeof r.sessionIdPrefix === "string"
       ? r.sessionIdPrefix
       : DEFAULT_CONFIG.sessionIdPrefix,
+    // v0.3.5: wake-word short-circuit (mirrors xiaozhi-esp32-server
+    //   config.yaml wakeup_words + enable_greeting).
+    wakeupWords: Array.isArray(r.wakeupWords)
+      ? (r.wakeupWords as unknown[]).filter((s): s is string => typeof s === "string")
+      : undefined,
+    enableGreeting: typeof r.enableGreeting === "boolean"
+      ? r.enableGreeting
+      : true, // default: greet (matches official)
+    greeting: typeof r.greeting === "string"
+      ? r.greeting
+      : "嘿，你好呀", // default: matches official
   };
 }
 
@@ -133,6 +165,9 @@ export function resolveAccount(rawChannels: unknown, accountId: string = DEFAULT
     authTokens: config.authTokens,
     globalAuthToken: config.globalAuthToken,
     sessionIdPrefix: config.sessionIdPrefix,
+    wakeupWords: config.wakeupWords,
+    enableGreeting: config.enableGreeting,
+    greeting: config.greeting,
   };
 }
 

@@ -61,6 +61,22 @@ export function getXiaozhiTtsConfig(): {
   return (channel as { tts?: { provider: "mock" | "edge" | "minimax" | "cloud"; options?: Record<string, unknown> } }).tts;
 }
 
+/**
+ * v0.3.5: return the raw channels.xiaozhi config object so callers
+ * can read non-schema-declared fields (wakeupWords / enableGreeting /
+ * greeting — openclaw's schema validator strips these from
+ * ctx.account). Use this for runtime knobs that the channel
+ * schema doesn't model, NOT for asr/tts (use getXiaozhiAsrConfig
+ * / getXiaozhiTtsConfig for those).
+ */
+export function getXiaozhiChannelConfig(): Record<string, unknown> | undefined {
+  if (!moduleCfg) return undefined;
+  const channel = (moduleCfg as { channels?: { xiaozhi?: unknown } })
+    .channels?.xiaozhi;
+  if (!channel || typeof channel !== "object") return undefined;
+  return channel as Record<string, unknown>;
+}
+
 /** DirectDmRuntime shim. Explicit return type to dodge TS2742 (cross-package inferred type). */
 export function buildDirectDmRuntime(pluginRuntime: PluginRuntime): {
   channel: {

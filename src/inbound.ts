@@ -18,9 +18,32 @@ import type { WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 import type { XiaozhiAccount } from "./config.js";
 import { dispatchInboundDirectDmWithRuntime } from "openclaw/plugin-sdk/channel-inbound";
-import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig } from "./api.js";
-import { sendSttMessage, sendLlmMessage } from "./outbound.js";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig } from "./api.js";
+import { sendSttMessage, sendLlmMessage, sendTtsAudio } from "./outbound.js";
+import { getTTSProvider } from "./tts/index.js";
 import { OpusCodec } from "./audio.js";
+// M3.7.3: borrow the same TTS→opus streaming helper that handleListenStop
+// uses for the Listen(stop) path. The detect path was M3.3b-stubbed to
+// text-only and is now being upgraded to match.
+import { streamTtsToOpusFrames } from "./handle/esp32ListenHandler.js";
+
+// v0.3.5: helper for wake-word short-circuit (mirrors
+//   xiaozhi-esp32-server core/utils/util.py:remove_punctuation_and_length).
+//   We use a minimal version: strip Chinese + ASCII punctuation and
+//   collapse whitespace. We only need the filtered text for set
+//   membership (wakeup_words check), not for length tracking.
+function stripPunctuation(text: string): string {
+  return text
+    .replace(/[\s\u3000]+/g, "")
+    .replace(
+      /[\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65\u3000-\u303F!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~，。！？、；：""''「」『』《》（）【】]/g,
+      "",
+    );
+}
+
+// Exported under a different name for unit testing only — internal
+// use stays unexported.
+export const stripPunctuationForTest = stripPunctuation;
 import {
   parseClientMessage,
   serializeServerMessage,
@@ -31,7 +54,10 @@ import {
   createSessionContext,
   appendAudioFrame,
   cleanupSession,
+  drainAudioBuffer,
   transitionTo,
+  markTtsEnded,
+  isInPostTtsGrace,
   type SessionContext,
 } from "./session.js";
 import type { SessionStore } from "./gateway.js";
@@ -39,6 +65,7 @@ import { resolveMcpResponse } from "./mcp/outbound.js";
 import { registerEsp32Tools, unregisterEsp32Tools } from "./mcp/registry.js";
 import type { McpTool } from "./mcp/protocol.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
+import { startVadWatcher } from "./vad.js";
 
 export interface Esp32ConnectionCtx {
   account: XiaozhiAccount;
@@ -91,10 +118,91 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   const session = createSessionContext(deviceId, sessionId, codec);
   ctx.sessionStore.register(deviceId, session);
 
-  // 1. Wait for Hello
-  const helloMsg = await waitForJsonMessage(ws, "hello", log);
+  // M3.7.3: install a logger that names this session (so we can grep
+  // session-scoped log lines when chasing per-device bugs)
+  // (kept for future per-session log wiring; intentionally unused for now
+  // so TS noUnusedLocals doesn't fire — we'll thread it through once we
+  // know which frame drop path is responsible)
+  void deviceId;
+
+  // 1. Install permanent listeners + queue (M3.7.3: same queue the main
+  //    loop consumes, so even the hello handshake can use it without
+  //    falling back to a cleanup-and-rebind dance).
+  const incomingQueue: WsEvent[] = [];
+  let incomingResolve: (() => void) | null = null;
+  let incomingClosed = false;
+
+  const onAnyMessage = (data: unknown, isBinary: boolean) => {
+    const event: WsEvent = isBinary
+      ? { kind: "binary", data: toBuffer(data) }
+      : { kind: "text", data: typeof data === "string" ? data : toBuffer(data).toString("utf8") };
+    incomingQueue.push(event);
+    if (incomingResolve) {
+      const r = incomingResolve;
+      incomingResolve = null;
+      r();
+    }
+  };
+  const onClose = () => {
+    incomingClosed = true;
+    if (incomingResolve) {
+      const r = incomingResolve;
+      incomingResolve = null;
+      r();
+    }
+  };
+  const onError = (err: Error) => {
+    log.warn(`xiaozhi: ws error: ${err.message}`);
+    incomingClosed = true;
+    if (incomingResolve) {
+      const r = incomingResolve;
+      incomingResolve = null;
+      r();
+    }
+  };
+  ws.on("message", onAnyMessage as never);
+  ws.on("close", onClose);
+  ws.on("error", onError);
+
+  // 1a. Wait for Hello (consume from the same queue so we don't lose
+  //     anything arriving in the gap before main loop starts)
+  const awaitNext = (): Promise<void> =>
+    incomingQueue.length > 0 || incomingClosed
+      ? Promise.resolve()
+      : new Promise<void>((resolve) => {
+          incomingResolve = resolve;
+        });
+
+  const waitForJsonMessage = async (
+    expectedType: string,
+  ): Promise<ClientMessage | null> => {
+    while (!incomingClosed) {
+      while (incomingQueue.length > 0) {
+        const event = incomingQueue.shift()!;
+        if (event.kind !== "text") {
+          log.warn(`xiaozhi: expected JSON ${expectedType}, got binary`);
+          continue;
+        }
+        const msg = parseClientMessage(asTextData(event));
+        if (msg.type !== expectedType) {
+          log.warn(`xiaozhi: expected ${expectedType}, got ${msg.type}`);
+          continue;
+        }
+        return msg;
+      }
+      if (incomingClosed) return null;
+      await awaitNext();
+    }
+    return null;
+  };
+
+  const helloMsg = await waitForJsonMessage("hello");
   if (!helloMsg) {
     log.warn(`xiaozhi: ${deviceId} disconnected before Hello`);
+    // Detach listeners before bailing
+    ws.off("message", onAnyMessage as never);
+    ws.off("close", onClose);
+    ws.off("error", onError);
     return;
   }
 
@@ -103,8 +211,15 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   //    bridge/server.py:_handle_hello). esp32 firmware validates the
   //    sample_rate match and disconnects on mismatch (we hit this on the
   //    first real-device test — 30ms disconnect, 1008 close on mismatch).
-  const clientAudioParams = (helloMsg as { audio_params?: { sample_rate?: number; channels?: number; frame_duration?: number } }).audio_params
+  const clientAudioParams = (helloMsg as { audio_params?: { sample_rate?: number; channels?: number; frame_duration?: number; format?: string } }).audio_params
     ?? { format: "opus" as const, sample_rate: 16000, channels: 1, frame_duration: 60 };
+  // M3.7.3: persist audio_params on the session so downstream code can
+  // build a matching Opus decoder (was being read off a non-existent
+  // field before — surfaced as 'sample_rate=?' in listen-start log).
+  (session as { audioSampleRate?: number }).audioSampleRate = clientAudioParams.sample_rate ?? 16000;
+  (session as { audioChannels?: number }).audioChannels = clientAudioParams.channels ?? 1;
+  (session as { audioFrameDurationMs?: number }).audioFrameDurationMs = clientAudioParams.frame_duration ?? 60;
+  (session as { audioFormat?: string }).audioFormat = clientAudioParams.format ?? "opus";
   const serverHello = {
     type: "hello",
     transport: "websocket",
@@ -117,15 +232,31 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
     },
   } as ServerHello;
   ws.send(serializeServerMessage(serverHello));
-  log.info(`xiaozhi: ${deviceId} hello acked, session=${sessionId}`);
+  log.info(
+    `xiaozhi: ${deviceId} hello acked, session=${sessionId}, ` +
+    `audio=${clientAudioParams.sample_rate ?? 16000}Hz/${clientAudioParams.channels ?? 1}ch/` +
+    `${clientAudioParams.frame_duration ?? 60}ms`,
+  );
 
-  // 3. Message loop
-  let isClosed = false;
-  ws.on("close", () => { isClosed = true; });
-
-  while (!isClosed) {
-    const event = await nextEvent(ws, log);
-    if (!event) break;  // closed
+  // 3. Message loop — M3.7.3 rewrite: replace per-event cleanup-and-rebind
+  //    with a permanent listener + bounded queue. The previous design lost
+  //    messages when the cleanup→rebind gap coincided with a fast-arriving
+  //    frame (esp32 pushes 35 wake-word opus frames in ~232ms, so any
+  //    synchronous gap between off() and on() can drop the trailing
+  //    Listen(detect) text — which is what we observed on the prod
+  //    board: 0 plugin log lines for the detect text after the wake-word
+  //    opus burst).
+  //
+  //    The fix mirrors the official xiaozhi-esp32-server pattern
+  //    (core/connection.py:335 _route_message): a single OnData callback
+  //    that synchronously queues each message, and a consumer loop that
+  //    awaits the queue. No cleanup-and-rebind, no lost messages.
+  while (!incomingClosed) {
+    while (incomingQueue.length === 0 && !incomingClosed) {
+      await awaitNext();
+    }
+    if (incomingClosed) break;
+    const event = incomingQueue.shift()!;
 
     if (event.kind === "text") {
       try {
@@ -135,14 +266,51 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
         console.error("BAD MSG", deviceId, err); log.warn(`xiaozhi: bad message from ${deviceId}:`, (err as Error)?.stack ?? (err as Error)?.message ?? String(err));
       }
     } else if (event.kind === "binary") {
-      // Opus frame for the active Listen session
-      if (session.state !== "LISTENING") {
-        log.debug(`xiaozhi: dropped binary frame in state ${session.state}`);
-        continue;
+      // M3.7.3: align with xiaozhi-esp32-server (core/connection.py:355
+      // _route_message) which accepts audio bytes regardless of session
+      // state — esp32 firmware sends 35 wake-word opus frames BEFORE
+      // SetListeningMode/SetDeviceState(kDeviceStateListening), and
+      // listening-mode text (ListenMessage detect/start/stop) is
+      // interleaved between frame bursts. The previous
+      // state==='LISTENING' guard caused 100% frame drop on the
+      // first real-device test.
+      //
+      // M3.7.3.1: but in SPEAKING/THINKING states, the device is
+      // playing TTS audio (or agent is thinking) — any mic frames we
+      // receive are almost certainly the speaker's audio being
+      // re-captured by the mic. Without AEC on the device side, this
+      // creates an infinite loop: plugin pushes TTS audio, device
+      // plays it, device's mic captures it, device pushes it back to
+      // us, we ASR-transcribe it (often returning garbage/empty), we
+      // send another listen.start, the device pushes more mic frames…
+      // The fix is to drop mic input in any non-LISTENING state except
+      // the IDLE→LISTENING auto-promotion edge case below.
+      if (session.state === "SPEAKING" || session.state === "THINKING") {
+        // Drop silently — this is echo of our own TTS, not user speech.
+        return;
+      }
+      // We still respect the state machine for *transitions*: if we're
+      // in IDLE and audio is arriving, the firmware is entering a listen
+      // turn — auto-promote to LISTENING so handleListenStop can find
+      // the frames when ListenMessage(stop) arrives.
+      if (session.state === "IDLE") {
+        transitionTo(session, "LISTENING");
+        log.info(`xiaozhi: ${ctx.deviceId} auto-transition IDLE→LISTENING on first opus frame`);
       }
       appendAudioFrame(session, asBinaryData(event));
+      // M3.7.3 debug: log first frame + every 50th to confirm consumption
+      const total = session.audioBuffer.length;
+      if (total === 1 || total % 50 === 0) {
+        log.info(`xiaozhi: ${ctx.deviceId} opus frame #${total} (${event.data.length} bytes)`);
+      }
     }
   }
+
+  // Detach listeners before cleanup so a late close/error doesn't
+  // poke the (now-dead) queue.
+  ws.off("message", onAnyMessage as never);
+  ws.off("close", onClose);
+  ws.off("error", onError);
 
   cleanupSession(session);
   ctx.sessionStore.unregister(deviceId);
@@ -172,38 +340,6 @@ function asBinaryData(event: WsEvent): Buffer {
   return event.data;
 }
 
-async function nextEvent(ws: WebSocket, log: Esp32ConnectionCtx["log"]): Promise<WsEvent | null> {
-  return new Promise((resolve) => {
-    function onAnyMessage(data: unknown, isBinary: boolean) {
-      cleanup();
-      if (isBinary) {
-        const buf = toBuffer(data);
-        resolve({ kind: "binary", data: buf });
-      } else {
-        const text = typeof data === "string" ? data : toBuffer(data).toString("utf8");
-        resolve({ kind: "text", data: text });
-      }
-    }
-    const onClose = () => {
-      cleanup();
-      resolve(null);
-    };
-    const onError = (err: Error) => {
-      log.warn(`xiaozhi: ws error:`, err.message);
-      cleanup();
-      resolve(null);
-    };
-    function cleanup() {
-      ws.off("message", onAnyMessage as never);
-      ws.off("close", onClose);
-      ws.off("error", onError);
-    }
-    ws.on("message", onAnyMessage as never);
-    ws.on("close", onClose);
-    ws.on("error", onError);
-  });
-}
-
 function toBuffer(data: unknown): Buffer {
   if (Buffer.isBuffer(data)) return data;
   if (data instanceof Uint8Array) return Buffer.from(data);
@@ -211,23 +347,87 @@ function toBuffer(data: unknown): Buffer {
   return Buffer.alloc(0);
 }
 
-async function waitForJsonMessage(
-  ws: WebSocket,
-  expectedType: string,
+/**
+ * v0.3.5: deliver a short, local text reply directly to the device
+ * without dispatching to the LLM agent. Used by the wake-word
+ * short-circuit path: when the user says "你好小智" we don't want
+ * the agent to spin up and explain "我是贾维斯" (which it does on
+ * every wake-up, even when there's no real question). Mirrors
+ * xiaozhi-esp32-server's "enable_greeting + greeting" path.
+ *
+ * Pipeline matches what the detect deliver-callback does for the
+ * real-LLM path, minus the agent dispatch:
+ *   1. sendLlmMessage (esp32 display shows the text)
+ *   2. transitionTo(SPEAKING)
+ *   3. TTS synth → 24kHz opus frames
+ *   4. sendTtsAudio (esp32 plays audio)
+ *   5. transitionTo(IDLE) in finally
+ */
+async function deliverLocalReply(
+  ctx: Esp32ConnectionCtx,
+  session: SessionContext,
+  text: string,
   log: Esp32ConnectionCtx["log"],
-): Promise<ClientMessage | null> {
-  const event = await nextEvent(ws, log);
-  if (!event) return null;
-  if (event.kind !== "text") {
-    log.warn(`xiaozhi: expected JSON ${expectedType}, got binary`);
-    return null;
+): Promise<void> {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return;
+  sendLlmMessage(ctx.ws, ctx.sessionId, undefined, trimmed);
+  log.info(
+    `xiaozhi: ${ctx.deviceId} local reply: "${trimmed.slice(0, 80)}${trimmed.length > 80 ? "…" : ""}"`,
+  );
+
+  const ttsCfg = (() => {
+    try { return getXiaozhiTtsConfig(); } catch (e) {
+      log.warn(`xiaozhi: TTS config not available (${(e as Error).message}), skipping audio`);
+      return null;
+    }
+  })();
+  if (!ttsCfg) {
+    transitionTo(session, "IDLE");
+    return;
   }
-  const msg = parseClientMessage(asTextData(event));
-  if (msg.type !== expectedType) {
-    log.warn(`xiaozhi: expected ${expectedType}, got ${msg.type}`);
-    return null;
+  const tts = (() => {
+    try { return getTTSProvider(ttsCfg); } catch (e) {
+      log.warn(`xiaozhi: TTS provider init failed (${(e as Error).message}), skipping audio`);
+      return null;
+    }
+  })();
+  if (!tts) {
+    transitionTo(session, "IDLE");
+    return;
   }
-  return msg;
+
+  // Encoder for esp32 TTS audio: 24kHz mono (device output rate,
+  // not mic capture rate).
+  const encoder = new OpusCodec(24000);
+  transitionTo(session, "SPEAKING");
+  const ttsStart = Date.now();
+  try {
+    const opusFrames = await streamTtsToOpusFrames(
+      tts as never,
+      trimmed,
+      encoder,
+      {
+        info: (m: string, ...a: unknown[]) => log.info(m, ...a),
+        warn: (m: string, ...a: unknown[]) => log.warn(m, ...a),
+        error: (m: string, ...a: unknown[]) => log.error(m, ...a),
+        debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
+      } as never,
+    );
+    const ttsMs = Date.now() - ttsStart;
+    log.info(
+      `xiaozhi: ${ctx.deviceId} tts ${ttsMs}ms → ${opusFrames.length} opus frames ` +
+      `(${(trimmed.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
+    );
+    if (opusFrames.length > 0) {
+      sendTtsAudio(ctx.ws, ctx.sessionId, trimmed, opusFrames);
+    }
+  } catch (ttsErr) {
+    log.error(`xiaozhi: ${ctx.deviceId} TTS encode failed:`, (ttsErr as Error).message);
+  } finally {
+    transitionTo(session, "IDLE");
+    markTtsEnded(session, trimmed, log);
+  }
 }
 
 async function dispatchClientMessage(
@@ -244,22 +444,165 @@ async function dispatchClientMessage(
 
     case "listen": {
       if (msg.state === "start") {
+        // M3.7.3.1: if we are still in SPEAKING/THINKING (TTS still
+        // pushing or agent still thinking), esp32 is just reporting
+        // that it heard its own speaker output. Don't start a new
+        // listening cycle — just acknowledge and wait for the TTS
+        // pipeline to complete its transitionTo(IDLE).
+        if (session.state === "SPEAKING" || session.state === "THINKING") {
+          log.info(
+            `xiaozhi: ${ctx.deviceId} listen start ignored — session in ${session.state} ` +
+            `(TTS/agent still busy, mic frames would be speaker echo)`,
+          );
+          return;
+        }
         // M3.2 stub: just record the start; full audio dispatch lands in M3.4
         // when we have the openclaw channelRuntime wired in.
         transitionTo(session, "LISTENING");
-        log.info(`xiaozhi: ${ctx.deviceId} listen start, sample_rate=${(session as { audioSampleRate?: number }).audioSampleRate ?? "?"}`);
+        // M3.7.3 server-side VAD: in non-manual modes esp32 never sends
+        // a stop, so we run our own RMS-based VAD and synthesize a stop
+        // when 1s of silence follows speech. The official backend
+        // (core/providers/vad/silero.py) does the same thing with an
+        // ONNX classifier — RMS is good enough for a near-field mic.
+        const mode = (msg.mode as "auto" | "manual" | "realtime" | undefined) ?? null;
+        session.clientListenMode = mode;
+        log.info(
+          `xiaozhi: ${ctx.deviceId} listen start, mode=${mode ?? "?"}, ` +
+          `sample_rate=${(session as { audioSampleRate?: number }).audioSampleRate ?? "?"}`,
+        );
+        // Stop any watcher from a previous turn before starting a new one
+        if (session.vadWatcher) {
+          session.vadWatcher.stop();
+          session.vadWatcher = null;
+        }
+        if (mode !== "manual") {
+          session.vadWatcher = startVadWatcher({
+            deviceId: ctx.deviceId,
+            session,
+            log: {
+              info: (m, ...a) => log.info(m, ...a),
+              warn: (m, ...a) => log.warn(m, ...a),
+              error: (m, ...a) => log.error(m, ...a),
+              debug: (m, ...a) => log.debug(m, ...a),
+            },
+            onSilence: async () => {
+              // v0.3.6: post-TTS echo suppression (fixes "wakes up,
+              // says reply twice" bug). Right after our TTS push ends,
+              // the esp32 mic re-captures the TTS audio we just sent
+              // (the device has no AEC). If we let the VAD fire on
+              // that echo, ASR returns garbage, the agent loop gets
+              // dispatched, and the user hears the same reply twice.
+              // We suppress the dispatch for POST_TTS_GRACE_MS (2s by
+              // default) after TTS ends, then resume normal VAD
+              // behavior on the *next* listen.start.
+              if (isInPostTtsGrace(session)) {
+                log.info(
+                  `xiaozhi: ${ctx.deviceId} VAD stop suppressed — ` +
+                  `inside post-TTS grace window (last reply was "${session.lastTtsText?.slice(0, 40)}")`,
+                );
+                // Drain the buffer anyway so we don't accumulate
+                // future echo frames, but skip the ASR+dispatch.
+                drainAudioBuffer(session);
+                transitionTo(session, "IDLE");
+                return;
+              }
+              // Mirror what ListenMessage(stop) would do — drain audio,
+              // run ASR, dispatch to LLM, push TTS. handleListenStop
+              // transitions state to IDLE on completion, which is fine:
+              // esp32 in realtime mode will then see a tts state=stop
+              // from us and re-enter LISTENING (it never actually
+              // returns to idle in this mode, so this loop is by
+              // design — user keeps talking, VAD keeps triggering).
+              await handleListenStop(ctx, session);
+              // After dispatch, esp32 will push a fresh listen.start
+              // on the next wake word / touch key. The new start will
+              // tear this watcher down and start a fresh one. If no
+              // new start comes, we just sit here.
+            },
+          });
+        }
       } else if (msg.state === "stop") {
         // M3.4c/d: full pipeline — drain → ASR → dispatch → TTS
+        // Also tear down our VAD watcher — esp32 took over, no need to
+        // race the user's listen.stop with our 1s-silence trigger.
+        if (session.vadWatcher) {
+          session.vadWatcher.stop();
+          session.vadWatcher = null;
+        }
         await handleListenStop(ctx, session);
         return;
       } else if (msg.state === "detect") {
-        // Listen(detect) + text — bypass ASR, send text directly
+        // Listen(detect) + text — bypass ASR, send text directly.
+        // The detect path is the wake-word path: esp32's on-board AFE
+        // recognized "你好小智" and pushed the recognized text along
+        // with a state=detect marker. This is the only path that
+        // doesn't need ASR on our side.
+        // Also stop the VAD watcher if any — wake word implies the
+        // device is now in a new turn, the old turn's audio is moot.
+        if (session.vadWatcher) {
+          session.vadWatcher.stop();
+          session.vadWatcher = null;
+        }
         const text = (msg.text ?? "").trim();
         if (text.length === 0) {
           log.warn(`xiaozhi: ${ctx.deviceId} detect with empty text`);
           return;
         }
         log.info(`xiaozhi: ${ctx.deviceId} detect: ${text}`);
+
+        // v0.3.5: wake-word short-circuit (mirrors official
+        //   xiaozhi-esp32-server core/handle/textHandler/listenMessageHandler.py).
+        //   The official backend distinguishes wake-up words from real
+        //   user input: if the text matches a configured wakeup_word,
+        //   it sends STT echo + a fixed greeting (or just tts=stop if
+        //   enable_greeting=false) — it does NOT dispatch to the LLM.
+        //   This is the fix for "every wake-up says 我是贾维斯 twice":
+        //   plugin previously dispatched the wake word to the agent
+        //   loop, the agent always answered with the same self-intro,
+        //   and on the next VAD cycle the esp32 mic picked up the TTS
+        //   echo and triggered a second identical reply.
+        const xCfg = getXiaozhiChannelConfig() as {
+          wakeupWords?: string[];
+          enableGreeting?: boolean;
+          greeting?: string;
+        } | undefined;
+        const wakeupWords = xCfg?.wakeupWords ?? [];
+        if (wakeupWords.length > 0) {
+          const filtered = stripPunctuation(text);
+          const isWakeup = wakeupWords.some(
+            (w) => stripPunctuation(w) === filtered,
+          );
+          if (isWakeup) {
+            log.info(
+              `xiaozhi: ${ctx.deviceId} detect is wakeup word ` +
+              `("${text}" matches wakeup_words) — short-circuiting ` +
+              `agent dispatch`,
+            );
+            // 1. STT echo so esp32 display shows the recognized text
+            sendSttMessage(ctx.ws, ctx.sessionId, text);
+            // 2. Skip LLM dispatch (the wake word is not a real user
+            //    question — it's just the user saying "hi, wake up").
+            //    Either play the configured greeting or send tts=stop
+            //    if greetings are disabled. The device returns to
+            //    idle and waits for the next user command.
+            const enableGreeting = xCfg?.enableGreeting !== false;
+            if (!enableGreeting) {
+              sendTtsAudio(ctx.ws, ctx.sessionId, "", []);
+              log.info(
+                `xiaozhi: ${ctx.deviceId} enableGreeting=false, ` +
+                `sent tts=stop, returning to idle`,
+              );
+            } else {
+              const greeting =
+                typeof xCfg?.greeting === "string" && xCfg.greeting.length > 0
+                  ? xCfg.greeting
+                  : "嘿，你好呀";
+              await deliverLocalReply(ctx, session, greeting, log);
+            }
+            return;
+          }
+        }
+
         transitionTo(session, "THINKING");
 
         // Dispatch into openclaw agent loop
@@ -289,12 +632,71 @@ async function dispatchClientMessage(
             messageId: randomUUID(),
             timestamp: Date.now(),
             deliver: async (payload) => {
-              // M3.3b: outbound text only (no TTS audio yet).
-              // TTS pipeline lands in M3.4.
+              // M3.7.3: wire up the TTS pipeline that was stubbed in
+              // M3.3b. The text was being delivered to the device as an
+              // LLM message (which is why the esp32 display showed it)
+              // but the audio never reached the speaker. This mirrors
+              // the TTS path that handleListenStop has used since M3.4d.
               const text = String((payload as { text?: string })?.text ?? "").trim();
-              if (text) {
-                sendLlmMessage(ctx.ws, ctx.sessionId, undefined, text);
-                log.info(`xiaozhi: ${ctx.deviceId} delivered: ${text.slice(0, 80)}`);
+              if (!text) return;
+              sendLlmMessage(ctx.ws, ctx.sessionId, undefined, text);
+              log.info(`xiaozhi: ${ctx.deviceId} delivered: ${text.slice(0, 80)}`);
+
+              // Synthesize + stream TTS audio. Use the session's
+              // negotiated audio params so the encoder matches what
+              // the device expects (16kHz mono / 60ms frames).
+              const ttsCfg = (() => {
+                try { return getXiaozhiTtsConfig(); } catch (e) {
+                  log.warn(`xiaozhi: TTS config not available (${(e as Error).message}), skipping audio`);
+                  return null;
+                }
+              })();
+              if (!ttsCfg) return;
+              const tts = (() => {
+                try { return getTTSProvider(ttsCfg); } catch (e) {
+                  log.warn(`xiaozhi: TTS provider init failed (${(e as Error).message}), skipping audio`);
+                  return null;
+                }
+              })();
+              if (!tts) return;
+
+              const sampleRate = (session as { audioSampleRate?: number }).audioSampleRate ?? 24000;
+              // OpusCodec requires a literal sample rate (8000|16000|24000|48000).
+              // esp32 negotiates 16kHz mic but the device output is 24kHz, so
+              // we always encode TTS at 24kHz to match the speaker pipeline.
+              const encoderSampleRate = 24000 as const;
+              const encoder = new OpusCodec(encoderSampleRate);
+              void sampleRate;
+              const ttsStart = Date.now();
+              try {
+                const opusFrames = await streamTtsToOpusFrames(
+                  tts as never,
+                  text,
+                  encoder,
+                  {
+                    info: (m: string, ...a: unknown[]) => log.info(m, ...a),
+                    warn: (m: string, ...a: unknown[]) => log.warn(m, ...a),
+                    error: (m: string, ...a: unknown[]) => log.error(m, ...a),
+                    debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
+                  } as never,
+                );
+                const ttsMs = Date.now() - ttsStart;
+                log.info(
+                  `xiaozhi: ${ctx.deviceId} tts ${ttsMs}ms → ${opusFrames.length} opus frames ` +
+                  `(${(text.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
+                );
+                if (opusFrames.length > 0) {
+                  sendTtsAudio(ctx.ws, ctx.sessionId, text, opusFrames);
+                }
+                // v0.3.6: mark TTS ended so the post-TTS echo grace
+                // window activates. Without this, the next VAD stop
+                // dispatches a 2nd identical reply to the agent loop.
+                markTtsEnded(session, text, log);
+              } catch (err) {
+                log.error(`xiaozhi: ${ctx.deviceId} TTS failed: ${(err as Error).message}`);
+                // TTS failed but text was already delivered — esp32 will
+                // still see the LLM message on its display. Device just
+                // won't play audio.
               }
             },
             onRecordError: (err) => log.error(`xiaozhi: record error:`, err),
