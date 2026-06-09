@@ -214,19 +214,11 @@ export function handleMcpResponse(
  * Response format follows the same JSON-RPC 2.0 envelope the esp32
  * would normally see for its own outbound tools/call. The session_id
  * wrapper follows the xiaozhi protocol convention.
+ *
+ * C 方案: 直接用 openclaw `ChannelAgentTool` 类型 (跟 mcp/tools.ts 里
+ * createListDevicesTool / createEsp32DeviceToolRouter 一致).
+ * 真实签名 execute(toolCallId, params) → { content, details, isError? }.
  */
-export interface OpenClawAgentTool {
-  name: string;
-  description?: string;
-  inputSchema?: { type: "object"; properties?: Record<string, unknown>; required?: string[] };
-  execute: (params: Record<string, unknown>) => Promise<{
-    content: Array<
-      | { type: "text"; text: string }
-      | { type: "image"; data: string; mimeType: string }
-    >;
-    isError?: boolean;
-  }>;
-}
 
 /**
  * Provider of the *current* openclaw agent tool list. Recomputed on
@@ -235,16 +227,16 @@ export interface OpenClawAgentTool {
  * Default: a no-op empty list. The real provider is installed by
  * plugin-xiaozhi.ts at module-load time using setOpenClawAgentToolsProvider.
  */
-let toolsProvider: () => OpenClawAgentTool[] = () => [];
+let toolsProvider: () => ChannelAgentTool[] = () => [];
 
 export function setOpenClawAgentToolsProvider(
-  provider: () => OpenClawAgentTool[],
+  provider: () => ChannelAgentTool[],
 ): void {
   toolsProvider = provider;
 }
 
 /** Snapshot the current openclaw agent tool list (re-resolved each call). */
-export function getOpenClawAgentTools(): OpenClawAgentTool[] {
+export function getOpenClawAgentTools(): ChannelAgentTool[] {
   return toolsProvider();
 }
 
@@ -319,11 +311,18 @@ export async function handleEsp32McpRequest(
   if (method === "tools/list") {
     // v0.3.7: convert openclaw tool list to MCP McpTool shape.
     const tools = getOpenClawAgentTools();
-    const mcpTools: McpTool[] = tools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: t.inputSchema,
-    }));
+    const mcpTools: McpTool[] = tools.map((t) => {
+      // ChannelAgentTool 用 `parameters` 字段 (zod TSchema, 不是 {type:object})
+      // MCP McpTool.inputSchema 要 { type: "object", properties?, required? }
+      // ChannelAgentTool.parameters 在运行时就是 JSON Schema (zod 派生的)
+      // 这里强制 cast unknown → McpTool["inputSchema"]
+      const p = (t as unknown as { parameters?: unknown }).parameters;
+      return {
+        name: t.name,
+        description: t.description,
+        inputSchema: p as McpTool["inputSchema"] | undefined,
+      };
+    });
     sendMcpResponse(ws, session.sessionId, id, { tools: mcpTools });
     log.info(
       `xiaozhi: ${session.deviceId} tools/list served ${mcpTools.length} tools: ${mcpTools.map((t) => t.name).join(", ")}`,
@@ -347,14 +346,20 @@ export async function handleEsp32McpRequest(
       return;
     }
     try {
-      const out = await tool.execute(args);
+      // ChannelAgentTool.execute signature: (toolCallId, params) → result
+      const out = await tool.execute(`xiaozhi-mcp-${id}-${Date.now()}`, args);
+      // OpenClaw AgentToolResult shape: { content, details, isError? }
+      const content = Array.isArray((out as { content?: unknown }).content)
+        ? (out as { content: unknown[] }).content
+        : [{ type: "text" as const, text: JSON.stringify(out) }];
+      const isError = (out as { isError?: boolean }).isError;
       sendMcpResponse(ws, session.sessionId, id, {
-        content: out.content,
-        ...(out.isError ? { isError: out.isError } : {}),
+        content,
+        ...(isError ? { isError } : {}),
       });
       log.info(
         `xiaozhi: ${session.deviceId} tool '${toolName}' executed, ` +
-        `${out.content.length} content blocks, isError=${out.isError ?? false}`,
+        `${content.length} content blocks, isError=${isError ?? false}`,
       );
     } catch (err) {
       const e = err as Error;
