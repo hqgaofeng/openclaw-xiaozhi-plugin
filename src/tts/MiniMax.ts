@@ -51,6 +51,12 @@
 import { request as httpRequest } from "node:https";
 import { TTSError, type TTSChunk, type TTSProvider } from "./types.js";
 import { frameSizeBytes } from "../audio.js";
+// v0.4.0-rc4 (batch 4): opt-in retry around the HTTP request. When
+// useRetry=false (default), the withBackoff branch is unreachable and
+// we run the existing streamHttp() once — byte-for-byte identical to
+// v0.4.0-rc3.
+import { withBackoff, isNetworkError, is5xxError } from "../retry.js";
+import { getUseRetry } from "../api.js";
 
 const ENDPOINT_HOST = "api.minimaxi.com";
 const ENDPOINT_PATH = "/v1/t2a_v2";
@@ -130,7 +136,19 @@ export class MiniMaxTTS implements TTSProvider {
     });
 
     // Collect all frames from HTTP chunked response.
-    const frames: Buffer[] = await this.streamHttp(body);
+    // v0.4.0-rc4 (batch 4): opt-in retry. When useRetry=true, the
+    // HTTP request is wrapped in withBackoff with the same defaults
+    // as the ASR call site. When false (default), we call streamHttp
+    // once and treat any error as fatal — identical to v0.4.0-rc3.
+    const useRetry = getUseRetry();
+    const frames: Buffer[] = useRetry
+      ? await withBackoff(() => this.streamHttp(body), {
+          attempts: 3,
+          baseMs: 100,
+          maxMs: 5000,
+          retryOn: (err) => isNetworkError(err) || is5xxError(err),
+        })
+      : await this.streamHttp(body);
     if (frames.length === 0) {
       throw new TTSError("MiniMax TTS: no audio frames received");
     }

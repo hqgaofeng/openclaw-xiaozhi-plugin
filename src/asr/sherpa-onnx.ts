@@ -31,6 +31,12 @@
 
 import type { ASRProvider, ASRResult, PCMBuffer } from "./types.js";
 import { ASRError } from "./types.js";
+// v0.4.0-rc4 (batch 4): opt-in retry around model load. The model
+// load happens once per recognizer (lazily on first transcribe);
+// retrying it 2x handles the "sherpa-onnx native binding not ready"
+// cold-start race that occasionally surfaces on first request.
+import { withBackoff, isNetworkError } from "../retry.js";
+import { getUseRetry } from "../api.js";
 
 export interface SherpaOnnxASRConfig {
   /** Directory containing tokens.txt + encoder/decoder/joiner .onnx. */
@@ -113,7 +119,22 @@ export class SherpaOnnxASR implements ASRProvider {
       decodingMethod: cfg.decodingMethod,
     };
     try {
-      this.recognizer = sherpa.createOnlineRecognizer(recognizerConfig);
+      const createOnce = async () => sherpa.createOnlineRecognizer(recognizerConfig);
+      // v0.4.0-rc4 (batch 4): opt-in retry. When useRetry=false
+      // (default), call createOnce() once — byte-for-byte identical
+      // to v0.4.0-rc3. When true, retry 2 times on network errors
+      // (2 attempts is enough for the cold-start race; longer retries
+      // wouldn't help because the model dir is local).
+      if (getUseRetry()) {
+        this.recognizer = await withBackoff(createOnce, {
+          attempts: 2,
+          baseMs: 100,
+          maxMs: 1000,
+          retryOn: isNetworkError,
+        });
+      } else {
+        this.recognizer = await createOnce();
+      }
     } catch (err) {
       throw new ASRError(
         `sherpa-onnx: failed to create recognizer: ${(err as Error).message}\n` +

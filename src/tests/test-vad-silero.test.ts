@@ -93,6 +93,7 @@ vi.mock("../api.js", () => {
     getUseMultiFlagState: () => mockUseMultiFlagState,
     getUseAccumulatePcm: () => mockUseAccumulatePcm,
     getUseStreamingAsr: () => mockUseStreamingAsr,
+    getUseRetry: () => false,
     getMetricsEnabled: () => false,
   };
 });

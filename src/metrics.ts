@@ -426,3 +426,44 @@ export function incMultiFlagStateTransition(
     to: toValue,
   });
 }
+
+// ---------------------------------------------------------------------------
+// v0.4.0-rc4 (batch 4) — 4 new metric name constants + helpers
+// ---------------------------------------------------------------------------
+//
+// These cover the OAuth + retry helper features added in batch 4.
+// All are no-ops when metricsEnabled=false.
+//
+//   XIAOZHI_RETRY_ATTEMPTS_TOTAL              — Counter, retry attempts
+//   XIAOZHI_OAUTH_TOKEN_REFRESH_TOTAL         — Counter, refresh outcomes
+//   XIAOZHI_OAUTH_TOKEN_REFRESH_DURATION_MS   — Histogram, refresh time
+//   XIAOZHI_OAUTH_INTROSPECT_TOTAL            — Counter, introspect calls
+
+export const METRIC_RETRY_ATTEMPTS_TOTAL = "xiaozhi_retry_attempts_total";
+export const METRIC_OAUTH_TOKEN_REFRESH_TOTAL = "xiaozhi_oauth_token_refresh_total";
+export const METRIC_OAUTH_TOKEN_REFRESH_DURATION_MS = "xiaozhi_oauth_token_refresh_duration_ms";
+export const METRIC_OAUTH_INTROSPECT_TOTAL = "xiaozhi_oauth_introspect_total";
+
+/**
+ * Record a retry attempt at a withBackoff call site. `provider` is
+ * one of "asr" | "tts" | "sherpa" (matches the 5 modified call sites).
+ * `attempt` is the 1-indexed attempt number that just failed.
+ */
+export function incRetryAttempts(provider: "asr" | "tts" | "sherpa", attempt: number): void {
+  incCounter(METRIC_RETRY_ATTEMPTS_TOTAL, { provider, attempt: String(attempt) });
+}
+
+/** Record an OAuth token refresh outcome (ok | error). */
+export function incOAuthTokenRefresh(status: "ok" | "error", grant: "client_credentials" | "refresh_token"): void {
+  incCounter(METRIC_OAUTH_TOKEN_REFRESH_TOTAL, { status, grant });
+}
+
+/** Record the wall-time of an OAuth token refresh (success or failure). */
+export function observeOAuthTokenRefreshDuration(durationMs: number, status: "ok" | "error"): void {
+  observe(METRIC_OAUTH_TOKEN_REFRESH_DURATION_MS, durationMs, { status });
+}
+
+/** Record an OAuth token introspection call outcome. */
+export function incOAuthIntrospect(status: "ok" | "inactive" | "failed"): void {
+  incCounter(METRIC_OAUTH_INTROSPECT_TOTAL, { status });
+}

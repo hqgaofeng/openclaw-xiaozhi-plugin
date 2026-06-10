@@ -32,6 +32,7 @@ vi.mock("../api.js", () => ({
     options: {},
   })),
   getXiaozhiAsrConfig: vi.fn(() => ({ provider: "mock", options: {} })),
+  getUseRetry: () => false,
 }));
 
 vi.mock("../tts/index.js", () => ({

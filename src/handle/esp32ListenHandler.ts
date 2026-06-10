@@ -30,7 +30,7 @@ import {
   transitionTo,
   type SessionContext,
 } from "../session.js";
-import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig, getMetricsEnabled } from "../api.js";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig, getMetricsEnabled, getUseRetry } from "../api.js";
 // v0.4.0-rc2 (batch 2): metrics helpers. The cfg-derived
 // `getMetricsEnabled()` flag is read on every call site; when false
 // (the default) the helpers are no-ops AND the `if (getMetricsEnabled())`
@@ -44,6 +44,14 @@ import { incCounter, observe } from "../metrics.js";
 // type information for the conditional block; the runtime cost is
 // zero (top-level imports of pure modules are tree-shakeable).
 import { startTtsPipeline } from "../ttsPipeline.js";
+// v0.4.0-rc4 (batch 4): opt-in retry helper. Imported statically for
+// type information; when useRetry=false (default), the call site uses
+// a literal `if (getUseRetry()) { ... } else { ... }` so the withBackoff
+// code path is unreachable in the default config. Same pattern as the
+// streaming TTS imports above.
+import { withBackoff, isNetworkError } from "../retry.js";
+// v0.4.0-rc4 (batch 4): batch-4 metric counters.
+import { incRetryAttempts } from "../metrics.js";
 
 export interface ListenStopCtx {
   account: XiaozhiAccount;
@@ -132,8 +140,29 @@ export async function handleListenStop(
   log.info(`xiaozhi: ${ctx.deviceId} asr=${asr.name} transcribing...`);
   const t0 = Date.now();
   let asrResult;
+  // v0.4.0-rc4 (batch 4): opt-in retry around asr.transcribe. When
+  // useRetry=false (default), the withBackoff branch is unreachable
+  // and we call asr.transcribe directly — byte-for-byte identical to
+  // v0.4.0-rc3. When useRetry=true, retry up to 3 times on network
+  // errors with 100ms base / 5s cap exponential backoff.
+  const useRetry = getUseRetry();
   try {
-    asrResult = await asr.transcribe(pcm);
+    if (useRetry) {
+      asrResult = await withBackoff(() => asr.transcribe(pcm), {
+        attempts: 3,
+        baseMs: 100,
+        maxMs: 5000,
+        retryOn: isNetworkError,
+        onRetry: (attempt, _err, _delayMs) => {
+          if (getMetricsEnabled()) {
+            incRetryAttempts("asr", attempt);
+          }
+          log.warn(`xiaozhi: ${ctx.deviceId} asr.transcribe retry ${attempt}/3`);
+        },
+      });
+    } else {
+      asrResult = await asr.transcribe(pcm);
+    }
   } catch (err) {
     const e = err as ASRError;
     log.error(`xiaozhi: ${ctx.deviceId} ASR failed:`, e.message);

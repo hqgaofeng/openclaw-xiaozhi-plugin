@@ -26,6 +26,15 @@ import { handleOtaRequest } from "./ota.js";
 // v0.4.0-rc2 (batch 2): metrics endpoint — same shape as OTA so the
 // HTTP server's path router just needs to add a new prefix.
 import { metricsHandler } from "./metrics.js";
+// v0.4.0-rc4 (batch 4): OAuth middleware (opt-in). Imported statically
+// for type safety; the runtime cost is zero because the middleware
+// throws OAuthDisabledError synchronously when the feature flag is off.
+// The actual fetch / network code paths are gated on getOAuthEnabled()
+// inside oauthMiddleware, so when useOAuth=false the OAuth code is
+// never reached (zero behavioural change vs v0.4.0-rc3).
+import {
+  OAuthDisabledError,
+} from "./oauth/middleware.js";
 
 export interface GatewayContext {
   cfg: unknown;
@@ -146,42 +155,23 @@ export async function startWssServer(
     maxPayload: 10 * 1024 * 1024,  // 10 MB
   });
 
+  // v0.4.0-rc4 (batch 4): the OAuth grayscale wrapper
+  // (runAuthAndConnect) reuses the same sessionStore via closure,
+  // so the V2 #6.1 path stays byte-for-byte identical.
+
   wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     const deviceId = extractDeviceId(req);
     const token = extractBearerToken(req);
-    const auth = checkAuth(token, deviceId, account);
 
-    if (!auth.ok) {
-      log.warn(`xiaozhi: rejected connection from ${req.socket.remoteAddress} (reason=${auth.reason})`);
-      ws.close(1008, auth.reason);  // 1008 = policy violation
-      return;
-    }
-
-    if (!deviceId) {
-      log.warn(`xiaozhi: connection without Device-Id header from ${req.socket.remoteAddress}`);
-      ws.close(1008, "no_device_id");
-      return;
-    }
-
-    const sessionId = `${account.sessionIdPrefix}-${randomUUID()}`;
-    log.info(`xiaozhi: device ${deviceId} connected, session=${sessionId}`);
-
-    handleEsp32Connection({
-      account,
-      deviceId,
-      sessionId,
-      ws,
-      log,
-      sessionStore,
-    }).catch((err) => {
-      log.error(`xiaozhi: handleEsp32Connection failed for ${deviceId}:`, err);
-      try { ws.close(1011, "internal_error"); } catch { /* ignore */ }
-    });
-
-    ws.on("close", () => {
-      log.info(`xiaozhi: device ${deviceId} disconnected`);
-      sessionStore.unregister(deviceId);
-    });
+    // v0.4.0-rc4 (batch 4): OAuth grayscale. When getOAuthEnabled()
+    // is true, route auth through oauthMiddleware (RFC 7662
+    // introspect). When false (the default), use the V2 #6.1
+    // Bearer path byte-for-byte. The flag is set once at plugin
+    // init from cfg.channels.xiaozhi.useOAuth via register.ts.
+    //
+    // The async wrapper is gated on a module-level flag so the
+    // OAuth code path is unreachable in the default config.
+    void runAuthAndConnect(ws, req, account, deviceId, token, log, sessionStore);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -206,6 +196,103 @@ export async function startWssServer(
   }
 
   return httpServer;
+}
+
+/**
+ * v0.4.0-rc4 (batch 4): auth + connect, with OAuth grayscale.
+ *
+ *   useOAuth=false (default): calls checkAuth() and proceeds.
+ *     Identical to the v0.4.0-rc3 path. All OAuth code is unreachable.
+ *   useOAuth=true:            calls oauthMiddleware() to validate
+ *     the Bearer / opaque session token via the AS introspect
+ *     endpoint. On ok, proceeds; on !ok, ws.close(1008, reason).
+ *
+ * Implementation note: the OAuth branch uses a dynamic import so
+ * the OAuth code path is not loaded into memory in the default
+ * config. The dynamic import is the only entry point to the OAuth
+ * module from the gateway, matching the "use dynamic import to
+ * prevent sandbox compile failure" note in the batch-4 spec.
+ */
+async function runAuthAndConnect(
+  ws: WebSocket,
+  req: IncomingMessage,
+  account: XiaozhiAccount,
+  deviceId: string | null,
+  token: string | null,
+  log: {
+    info: (msg: string, ...args: unknown[]) => void;
+    warn: (msg: string, ...args: unknown[]) => void;
+    error: (msg: string, ...args: unknown[]) => void;
+    debug: (msg: string, ...args: unknown[]) => void;
+  },
+  sessionStore: SessionStore,
+): Promise<void> {
+  let auth: { ok: boolean; reason: string };
+  try {
+    const mod = await import("./oauth/middleware.js");
+    if (mod.getOAuthEnabled()) {
+      const result = await mod.oauthMiddleware(req, account);
+      if (result.ok) {
+        auth = { ok: true, reason: "" };
+        // If the OAuth path returned a deviceId, prefer it over the
+        // header. This matters when the AS is the source of truth
+        // (e.g. a fleet of devices behind a load balancer).
+        if (result.deviceId) {
+          (req.headers as Record<string, string>)["device-id"] = result.deviceId;
+        }
+      } else {
+        auth = { ok: false, reason: result.reason };
+      }
+    } else {
+      // Default: V2 #6.1 Bearer path. Identical to v0.4.0-rc3.
+      auth = checkAuth(token, deviceId, account);
+    }
+  } catch (err) {
+    if (err instanceof OAuthDisabledError) {
+      // Flag flipped between check and call (config hot-reload) —
+      // fall back to V2 #6.1.
+      auth = checkAuth(token, deviceId, account);
+    } else {
+      log.error(`xiaozhi: auth check threw: ${(err as Error).message}`);
+      ws.close(1011, "internal_error");
+      return;
+    }
+  }
+
+  if (!auth.ok) {
+    log.warn(`xiaozhi: rejected connection from ${req.socket.remoteAddress} (reason=${auth.reason})`);
+    ws.close(1008, auth.reason);  // 1008 = policy violation
+    return;
+  }
+
+  // Re-read deviceId after potential OAuth override.
+  const finalDeviceId = extractDeviceId(req) ?? deviceId;
+  if (!finalDeviceId) {
+    log.warn(`xiaozhi: connection without Device-Id header from ${req.socket.remoteAddress}`);
+    ws.close(1008, "no_device_id");
+    return;
+  }
+
+  // Downstream: identical to the v0.4.0-rc3 connection body.
+  const sessionId = `${account.sessionIdPrefix}-${randomUUID()}`;
+  log.info(`xiaozhi: device ${finalDeviceId} connected, session=${sessionId}`);
+
+  handleEsp32Connection({
+    account,
+    deviceId: finalDeviceId,
+    sessionId,
+    ws,
+    log,
+    sessionStore,
+  }).catch((err) => {
+    log.error(`xiaozhi: handleEsp32Connection failed for ${finalDeviceId}:`, err);
+    try { ws.close(1011, "internal_error"); } catch { /* ignore */ }
+  });
+
+  ws.on("close", () => {
+    log.info(`xiaozhi: device ${finalDeviceId} disconnected`);
+    sessionStore.unregister(finalDeviceId);
+  });
 }
 
 export function createXiaozhiGatewayAdapter(): ChannelGatewayAdapter<XiaozhiAccount> {

@@ -15,7 +15,8 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { handleOtaRequest } from "./ota.js";
 import { metricsHandler, setMetricsEnabled as setMetricsModuleEnabled } from "./metrics.js";
-import { getMetricsEnabled as getMetricsEnabledFromCfg } from "./api.js";
+import { setOAuthEnabled } from "./oauth/middleware.js";
+import { getMetricsEnabled as getMetricsEnabledFromCfg, getOAuthEnabled as getOAuthEnabledFromCfg, getUseRetry as getUseRetryFromCfg } from "./api.js";
 
 /**
  * Register plugin-level concerns that don't fit into a ChannelPlugin
@@ -59,6 +60,11 @@ export function registerXiaozhiPlugin(api: OpenClawPluginApi): void {
   // the cfg is captured by setXiaozhiConfig() before this point.
   setMetricsModuleEnabled(getMetricsEnabledFromCfg());
 
+  // v0.4.0-rc4 (batch 4): sync the OAuth and retry feature flags
+  // from cfg to their respective module-level state. Same pattern
+  // as metrics: one-time push at plugin init.
+  setOAuthEnabled(getOAuthEnabledFromCfg());
+
   console.log(
     "[xiaozhi] registered OTA + metrics routes: " +
     "/api/xiaozhi/ota, /api/xiaozhi/ota/, " +
@@ -67,5 +73,10 @@ export function registerXiaozhiPlugin(api: OpenClawPluginApi): void {
   console.log(
     `[xiaozhi] metricsEnabled=${getMetricsEnabledFromCfg()} ` +
     `(disabled → /api/xiaozhi/metrics returns 404)`,
+  );
+  console.log(
+    `[xiaozhi] useOAuth=${getOAuthEnabledFromCfg()} ` +
+    `useRetry=${getUseRetryFromCfg()} ` +
+    `(disabled → OAuth/retry code paths unreachable)`,
   );
 }

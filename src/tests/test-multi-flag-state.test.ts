@@ -40,6 +40,7 @@ vi.mock("../api.js", () => {
     getUseSileroVad: () => mockUseSileroVad,
     getUseAccumulatePcm: () => mockUseAccumulatePcm,
     getUseStreamingAsr: () => mockUseStreamingAsr,
+    getUseRetry: () => false,
     getMetricsEnabled: () => false,
   };
 });

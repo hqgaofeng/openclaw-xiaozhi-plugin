@@ -29,6 +29,13 @@
 
 import type { ASRProvider, ASRResult, PCMBuffer } from "./types.js";
 import { ASRError } from "./types.js";
+// v0.4.0-rc4 (batch 4): opt-in retry around model load. Same as
+// sherpa-onnx.ts: only retries the createOnlineRecognizer() call
+// (2 attempts, 100ms base, 1s cap). The streaming provider is more
+// sensitive to cold-start races than the offline one because the
+// streaming path is the default when cfg.useStreamingAsr=true.
+import { withBackoff, isNetworkError } from "../retry.js";
+import { getUseRetry } from "../api.js";
 
 export interface SherpaOnnxStreamingConfig {
   /** Directory containing tokens.txt + encoder/decoder/joiner .onnx. */
@@ -168,8 +175,29 @@ export class SherpaOnnxStreamingASR implements ASRProvider {
       decodingMethod: cfg.decodingMethod,
     };
     try {
-      this.recognizer = sherpa.createOnlineRecognizer(recognizerConfig);
-      this.activeStream = this.recognizer.createStream();
+      const createOnce = async () => {
+        const rec = sherpa.createOnlineRecognizer(recognizerConfig);
+        const stream = rec.createStream();
+        return { rec, stream };
+      };
+      // v0.4.0-rc4 (batch 4): opt-in retry. When useRetry=false
+      // (default), call createOnce() once — byte-for-byte identical
+      // to v0.4.0-rc3. When true, retry 2 times on network errors.
+      type RecT = Awaited<ReturnType<SherpaOnnxModule["createOnlineRecognizer"]>>;
+      type StreamT = ReturnType<RecT["createStream"]>;
+      let result: { rec: RecT; stream: StreamT };
+      if (getUseRetry()) {
+        result = await withBackoff(createOnce, {
+          attempts: 2,
+          baseMs: 100,
+          maxMs: 1000,
+          retryOn: isNetworkError,
+        });
+      } else {
+        result = await createOnce();
+      }
+      this.recognizer = result.rec;
+      this.activeStream = result.stream;
     } catch (err) {
       throw new ASRError(
         `sherpa-onnx-streaming: failed to create recognizer: ${(err as Error).message}\n` +

@@ -114,6 +114,34 @@ export function getUseMultiFlagState(): boolean {
 }
 
 /**
+ * v0.4.0-rc4 (batch 4): read the OAuth feature flag from
+ * `channels.xiaozhi.useOAuth`. Default false. When true, the
+ * gateway routes the auth check through OAuthMiddleware
+ * (client_credentials + introspect) instead of the V2 #6.1
+ * Bearer path. The two paths COEXIST — the V2 #6.1 path is
+ * never modified, only bypassed.
+ */
+export function getOAuthEnabled(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useOAuth");
+}
+
+/**
+ * v0.4.0-rc4 (batch 4): read the retry helper feature flag
+ * from `channels.xiaozhi.useRetry`. Default false. When true,
+ * the 5 known external call sites wrap their function in
+ * `withBackoff` (with 3 attempts, 100ms base, 5xx + network
+ * error retryOn). When false, the call sites are byte-for-byte
+ * identical to v0.4.0-rc3.
+ */
+export function getUseRetry(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useRetry");
+}
+
+/**
  * v0.3.5: return the raw channels.xiaozhi config object so callers
  * can read non-schema-declared fields (wakeupWords / enableGreeting /
  * greeting — openclaw's schema validator strips these from
