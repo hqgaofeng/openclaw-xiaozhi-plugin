@@ -385,3 +385,44 @@ export async function metricsHandler(
   res.setHeader("Cache-Control", "no-store");
   res.end(JSON.stringify(snap));
 }
+
+// ---------------------------------------------------------------------------
+// v0.4.0-rc3 (batch 3) — 4 new metric name constants + helpers
+// ---------------------------------------------------------------------------
+//
+// These are convenience constants + thin wrappers that centralize
+// metric names. All are no-ops when metricsEnabled=false (the
+// underlying incCounter/observe helpers gate on the flag).
+//
+//   XIAOZHI_VAD_SILERO_INFERENCE_MS       — Histogram, silero ONNX time
+//   XIAOZHI_ASR_STREAMING_PARTIAL         — Counter, partial transcripts
+//   XIAOZHI_ASR_STREAMING_FINAL           — Counter, final transcripts
+//   XIAOZHI_MULTI_FLAG_STATE_TRANSITIONS  — Counter, flag transitions
+
+export const METRIC_VAD_SILERO_INFERENCE_MS = "xiaozhi_vad_silero_inference_ms";
+export const METRIC_ASR_STREAMING_PARTIAL = "xiaozhi_asr_streaming_partial";
+export const METRIC_ASR_STREAMING_FINAL = "xiaozhi_asr_streaming_final";
+export const METRIC_MULTI_FLAG_STATE_TRANSITIONS = "xiaozhi_multi_flag_state_transitions";
+
+/** Record a streaming ASR partial result (low latency, may be revised). */
+export function incAsrStreamingPartial(deviceId: string, by: number = 1): void {
+  incCounter(METRIC_ASR_STREAMING_PARTIAL, { device_id: deviceId }, by);
+}
+
+/** Record a streaming ASR final result (end of utterance). */
+export function incAsrStreamingFinal(deviceId: string, by: number = 1): void {
+  incCounter(METRIC_ASR_STREAMING_FINAL, { device_id: deviceId }, by);
+}
+
+/** Record a multi-flag state machine transition. */
+export function incMultiFlagStateTransition(
+  flagName: string,
+  fromValue: string,
+  toValue: string,
+): void {
+  incCounter(METRIC_MULTI_FLAG_STATE_TRANSITIONS, {
+    flag: flagName,
+    from: fromValue,
+    to: toValue,
+  });
+}

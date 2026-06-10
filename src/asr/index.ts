@@ -5,20 +5,22 @@
  * provider on first use. Lazy-loaded to keep plugin startup fast.
  *
  * Registered providers:
- *   - "mock"      — returns a canned string (M2 testing)
- *   - "sherpa_onnx" — local streaming Zipformer (M3.4a, this commit)
- *   - "cloud"     — stub for future aliyun/volcengine/aliyun integration
+ *   - "mock"                   — returns a canned string (M2 testing)
+ *   - "sherpa_onnx"            — local offline Zipformer (M3.4a)
+ *   - "sherpa_onnx_streaming"  — pull-based streaming Zipformer (v0.4.0-rc3)
+ *   - "cloud"                  — stub for future aliyun/volcengine integration
  */
 
 import type { ASRProvider } from "./types.js";
 import { ASRError } from "./types.js";
 import { SherpaOnnxASR } from "./sherpa-onnx.js";
+import { SherpaOnnxStreamingASR } from "./sherpa-onnx-streaming.js";
 
 let cachedProvider: ASRProvider | null = null;
 let cachedConfigKey: string | null = null;
 
 export interface ASRConfig {
-  provider: "mock" | "sherpa_onnx" | "cloud";
+  provider: "mock" | "sherpa_onnx" | "sherpa_onnx_streaming" | "cloud";
   options?: Record<string, unknown>;
 }
 
@@ -59,6 +61,26 @@ export function getASRProvider(asrCfg: ASRConfig | undefined): ASRProvider {
       });
       break;
     }
+    case "sherpa_onnx_streaming": {
+      const opts = (cfg.options ?? {}) as {
+        modelDir?: string;
+        numThreads?: number;
+        modelingUnit?: "bpe" | "cjkchar" | "cjk_bpe" | "en_bpe" | "char" | "bpe_cn";
+        bpeVocab?: string;
+        preferInt8?: boolean;
+      };
+      if (!opts.modelDir) {
+        throw new ASRError("sherpa_onnx_streaming ASR: options.modelDir is required");
+      }
+      cachedProvider = new SherpaOnnxStreamingASR({
+        modelDir: opts.modelDir,
+        numThreads: opts.numThreads,
+        modelingUnit: opts.modelingUnit,
+        bpeVocab: opts.bpeVocab,
+        preferInt8: opts.preferInt8,
+      });
+      break;
+    }
     case "mock": {
       cachedProvider = createMockASR();
       break;
@@ -72,7 +94,7 @@ export function getASRProvider(asrCfg: ASRConfig | undefined): ASRProvider {
   }
 
   cachedConfigKey = key;
-  return cachedProvider;
+  return cachedProvider as ASRProvider;
 }
 
 export function disposeASRProvider(): void {

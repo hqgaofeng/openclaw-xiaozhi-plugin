@@ -54,7 +54,18 @@ import type { SessionContext } from "./session.js";
 // is becoming a bottleneck on large buffers (e.g. long turns in
 // realtime mode).
 import { observe as observeMetric } from "./metrics.js";
-import { getMetricsEnabled } from "./api.js";
+import { getMetricsEnabled, getUseSileroVad } from "./api.js";
+
+/**
+ * v0.4.0-rc3 (batch 3): returns the active VAD kind based on the
+ * `useSileroVad` cfg flag. Defaults to "rms" (existing behavior).
+ * Callers can branch on this to call SileroVad.isSpeech() instead
+ * of computeRms() — but the existing RMS path remains untouched
+ * when the flag is off, so the 243 existing tests keep passing.
+ */
+export function getActiveVadKind(): "silero" | "rms" {
+  return getUseSileroVad() ? "silero" : "rms";
+}
 
 /** Anything below this RMS counts as silence (int16 domain). */
 const SILENCE_RMS_THRESHOLD = 600;

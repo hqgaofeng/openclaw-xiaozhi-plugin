@@ -75,7 +75,7 @@ import { startVadWatcher, bufferHasSpeech } from "./vad.js";
 // gated by `if (getMetricsEnabled())` so the labels-object allocation
 // is elided entirely when the feature is off.
 import { incCounter, setGauge } from "./metrics.js";
-import { getMetricsEnabled } from "./api.js";
+import { getMetricsEnabled, getUseAccumulatePcm } from "./api.js";
 
 export interface Esp32ConnectionCtx {
   account: XiaozhiAccount;
@@ -357,6 +357,36 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
           `xiaozhi: ${ctx.deviceId} opus frame #${total} (${event.data.length} bytes, ` +
           `state=${session.state}, codec=${(session.codec as { sampleRate?: number }).sampleRate ?? "?"}Hz)`,
         );
+      }
+      // v0.4.0-rc3 (batch 3): optional PCM accumulation. When
+      // useAccumulatePcm=true, decode the opus frame to int16 PCM
+      // right here and append the PCM samples to audioBuffer
+      // instead of the opus frame. The downstream ASR step then
+      // sees raw PCM, which the streaming sherpa provider wants
+      // anyway (saves a decode pass at ASR time).
+      //
+      // Off by default — the existing path (opus frames in
+      // audioBuffer, decoded by the VAD watcher / ASR) is battle-
+      // tested on the prod board. Allen flips this on to compare.
+      if (getUseAccumulatePcm()) {
+        try {
+          const pcm = session.codec.decode(asBinaryData(event));
+          session.audioBuffer.push(pcm);
+          // M3.7.3 debug: log first pcm frame
+          const pcmTotal = session.audioBuffer.length;
+          if (pcmTotal === 1 || pcmTotal % 50 === 0) {
+            log.debug(
+              `xiaozhi: ${ctx.deviceId} pcm frame #${pcmTotal} (${pcm.length} bytes int16, ` +
+              `state=${session.state})`,
+            );
+          }
+        } catch (err) {
+          // Bad opus frame — skip silently. The watcher / ASR
+          // will see one fewer frame, but won't crash.
+          log.debug(
+            `xiaozhi: ${ctx.deviceId} opus→pcm decode failed: ${(err as Error).message}`,
+          );
+        }
       }
     }
   }

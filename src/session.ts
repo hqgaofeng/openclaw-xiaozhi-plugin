@@ -85,6 +85,21 @@ export interface SessionContext {
   // early — preventing late TTS audio from reaching the device after
   // the user has already interrupted. Cleared on next Listen.start.
   aborted: boolean;
+
+  // v0.4.0-rc3 (batch 3): 4 new multi-flag state machine fields.
+  // Defaults to false / 0; only meaningful when the
+  // `useMultiFlagState` cfg flag is true. These track *parallel*
+  // signals alongside `state` — they don't replace it. See
+  // session-flags.ts for the helpers and session.test.ts for the
+  // "doesn't break existing 243 tests" guarantee.
+  /** esp32 has actually pushed voice frames in this session. */
+  clientHaveVoice: boolean;
+  /** esp32 has explicitly said voice stop (vs VAD-detected silence). */
+  clientVoiceStop: boolean;
+  /** Most recent VAD decision was "voice". */
+  lastIsVoice: boolean;
+  /** ms timestamp (Date.now()) of the most recent voice frame. */
+  vadLastVoiceTime: number;
 }
 
 export function createSessionContext(
@@ -118,6 +133,13 @@ export function createSessionContext(
     // without choking off natural back-and-forth conversation.
     postTtsGraceMs: 1500,
     aborted: false,        // v0.3.7: no in-flight TTS to cancel yet
+    // v0.4.0-rc3 (batch 3): 4 new flags default to false / 0.
+    // Only mutated when useMultiFlagState=true; otherwise the
+    // existing single-state machine is the source of truth.
+    clientHaveVoice: false,
+    clientVoiceStop: false,
+    lastIsVoice: false,
+    vadLastVoiceTime: 0,
   };
 }
 

@@ -76,6 +76,44 @@ export function getMetricsEnabled(): boolean {
 }
 
 /**
+ * v0.4.0-rc3 (batch 3): read the 4 grayscale feature flags.
+ * All default to false. Each is independent — Allen can flip any
+ * combination to validate the path in isolation.
+ *
+ *   useSileroVad     → server-side VAD via silero ONNX v4
+ *   useStreamingAsr  → ASR via OnlineRecognizer pull-based
+ *   useAccumulatePcm → inbound binary handler accumulates PCM (int16) directly
+ *   useMultiFlagState→ enable 4 new flags on SessionContext
+ */
+function readFlag(ch: Record<string, unknown>, key: string): boolean {
+  return (ch as Record<string, unknown>)[key] === true;
+}
+
+export function getUseSileroVad(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useSileroVad");
+}
+
+export function getUseStreamingAsr(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useStreamingAsr");
+}
+
+export function getUseAccumulatePcm(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useAccumulatePcm");
+}
+
+export function getUseMultiFlagState(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  return readFlag(ch, "useMultiFlagState");
+}
+
+/**
  * v0.3.5: return the raw channels.xiaozhi config object so callers
  * can read non-schema-declared fields (wakeupWords / enableGreeting /
  * greeting — openclaw's schema validator strips these from
