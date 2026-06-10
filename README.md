@@ -6,7 +6,7 @@
 >
 > openclaw 接管全部对话流程 (ASR/TTS/LLM/Memory/MCP)，plugin 只做 esp32 ↔ openclaw 翻译
 
-[![Status](https://img.shields.io/badge/status-v0.3.0-brightgreen)](https://github.com/hqgaofeng/openclaw-xiaozhi-plugin/releases/tag/v0.3.0)
+[![Status](https://img.shields.io/badge/status-v0.4.0-brightgreen)](https://github.com/hqgaofeng/openclaw-xiaozhi-plugin/releases/tag/v0.4.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 ![Node 20+](https://img.shields.io/badge/node-20+-green.svg)
 ![TypeScript 5.4+](https://img.shields.io/badge/typescript-5.4+-blue.svg)
@@ -47,6 +47,59 @@
 | LLM 集成 | ✅ openclaw/MiniMax-highspeed |
 | V2 容器 | ❌ xiaozhi-bridge + xiaozhi-bridge-api 都已卸 |
 | xiaozhi-bridge 仓 | 🏷️ `v0.2.13-legacy` tag (archival) |
+
+## v0.4.0 release (2026-06-10) — 12 项官方对齐重构
+
+**官方对齐**: 4 批 RC commits (`bf97051` → `38175f2` → `e10f978` → `38406c6`) + 1 批收口.
+**100% 向后兼容**: 所有新功能默认关闭,通过 8 个灰度开关 opt-in,V2 链路 100% 兼容.
+
+### 9 大新功能 (opt-in via 8 个灰度开关)
+
+| # | 功能 | 模块 | 灰度开关 | 触发效果 |
+|---|---|---|---|---|
+| 1 | **Streaming TTS pipeline** | `src/ttsPipeline.ts` | `useStreamingTts` | 3-queue / 3-worker 边收边播,首包延迟 ↓ |
+| 2 | **Text cleaner** (捆绑 #1) | `src/textCleaner.ts` | (随 #1 一起开) | `MarkdownCleaner` + `replace_words` + `IncrementalCleaner` |
+| 3 | **Metrics module** | `src/metrics.ts` | `metricsEnabled` | `/api/xiaozhi/metrics` JSON 导出 (Counter/Histogram/Gauge) |
+| 4 | **Silero ONNX VAD** | `src/vad-silero.ts` | `useSileroVad` | server-side VAD,断句准确度 ↑ |
+| 5 | **Streaming ASR** | `src/asr/sherpa-onnx-streaming.ts` | `useStreamingAsr` | `OnlineRecognizer` pull-based 流式识别 |
+| 6 | **PCM accumulation** | `src/inbound.ts` | `useAccumulatePcm` | opus decode 在 receive 即时,内存 ↓ |
+| 7 | **Multi-flag state machine** | `src/session-flags.ts` | `useMultiFlagState` | 4 个新 flag 上 SessionContext |
+| 8 | **OAuth multi-device** | `src/oauth/` | `useOAuth` | 多设备 Bearer token 验证 + store |
+| 9 | **Retry helper** | `src/retry.ts` | `useRetry` | exponential backoff 包装外部调用 |
+
+### 关键数字
+
+| 指标 | v0.3.0 | v0.4.0 | 变化 |
+|---|---|---|---|
+| TypeScript 源码 | ~2200 行 | ~3000 行 | +800 (9 模块) |
+| 测试 | 131 passed (11 files, v0.3.0 release) / 184 passed (15 files, 58c9afe pre-rc1) | **330 passed** (25 files) | **+146 tests / +10 files** (vs 58c9afe baseline) |
+| TypeScript 编译 | 0 errors | 0 errors | = |
+| 新模块 | 0 | 8 (textCleaner / ttsPipeline / metrics / vad-silero / sherpa-onnx-streaming / retry / oauth × 4) | +8 |
+| 灰度开关 | 0 | 8 (opt-in only) | +8 |
+| 依赖 | sherpa-onnx 1.13.2 | + `onnxruntime-node` ^1.20.0 | +1 |
+| 兼容性 | — | **100% 兼容 v0.3.0** | ✓ |
+
+### 启用示例
+
+```jsonc
+// /root/.openclaw/openclaw.json
+{
+  "channels": {
+    "xiaozhi": {
+      "useStreamingTts": true,      // batch 1 — streaming TTS + text cleaner
+      "metricsEnabled": true,        // batch 2 — 暴露 /api/xiaozhi/metrics
+      "useSileroVad": true,          // batch 3 — Silero ONNX VAD
+      "useStreamingAsr": true,       // batch 3 — pull-based streaming ASR
+      "useAccumulatePcm": true,      // batch 3 — receive-side opus decode
+      "useMultiFlagState": true,     // batch 3 — 4 new flags on SessionContext
+      "useOAuth": true,              // batch 4 — OAuth multi-device
+      "useRetry": true               // batch 4 — retry with exponential backoff
+    }
+  }
+}
+```
+
+**所有 flag 默认 `false` (or `undefined`)**. Allen 灰度节奏:测一项开一项,跑稳再开下一个.
 
 ## 架构
 
@@ -92,7 +145,7 @@ openclaw gateway (systemd service)  ← plugin 装在 ~/.openclaw/plugins/xiaozh
 npm install
 
 # 2. 跑测试
-npm test           # vitest, 131 tests
+npm test           # vitest, 330 tests (v0.4.0)
 npx tsc --noEmit   # type check
 
 # 3. build
