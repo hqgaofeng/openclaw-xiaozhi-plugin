@@ -247,6 +247,22 @@ export async function handleListenStop(
     log.error(`xiaozhi: dispatch failed for ${ctx.deviceId}:`, (err as Error).message);
     sendLlmMessage(ctx.ws, ctx.sessionId, undefined, `Error: ${(err as Error).message}`);
     transitionTo(session, "IDLE");
+  } finally {
+    // Bug 9 fix: the dispatch path (line 142) transitions to THINKING
+    // and the deliver callback transitions to SPEAKING + back to IDLE
+    // for grace-window purposes — but neither of those is the same
+    // as the canonical "session is fully idle, ready for the next
+    // user turn" transition. Without this finally block, the session
+    // stays in SPEAKING (or THINKING) forever after a successful
+    // LLM+TTS exchange, and the next listen.start is rejected with
+    // "session in SPEAKING" — exactly the "answered the weather
+    // question, then no further replies" bug.
+    //
+    // We use finally so the transition happens whether deliver
+    // succeeded, threw, or was never called.
+    if (session.state === "SPEAKING" || session.state === "THINKING") {
+      transitionTo(session, "IDLE");
+    }
   }
 }
 

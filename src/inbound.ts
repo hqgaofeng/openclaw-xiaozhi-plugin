@@ -221,13 +221,26 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   (session as { audioChannels?: number }).audioChannels = clientAudioParams.channels ?? 1;
   (session as { audioFrameDurationMs?: number }).audioFrameDurationMs = clientAudioParams.frame_duration ?? 60;
   (session as { audioFormat?: string }).audioFormat = clientAudioParams.format ?? "opus";
+  // Bug 8 fix: the serverHello's audio_params.sample_rate is what the
+  // esp32 firmware tags on every incoming audio packet as the "server
+  // sample rate". If we echo back the mic capture rate (16000) but
+  // the device's hardware output is 24kHz, the audio service resamples
+  // every TTS frame, producing audible discontinuities ("断断续续").
+  // The correct value is the device's TTS output rate (24kHz) — what
+  // we actually encode TTS frames at. Frame duration + channels come
+  // from the client (they're device-side constraints).
   const serverHello = {
     type: "hello",
     transport: "websocket",
     session_id: sessionId,
     audio_params: {
       format: "opus" as const,
-      sample_rate: clientAudioParams.sample_rate ?? 16000,
+      // Always claim 24kHz as the server sample rate, regardless of
+      // what the client said. Our OpusCodec encoder is fixed at 24kHz
+      // (see streamTtsToOpusFrames / frameSizeBytes(24000)). 16kHz or
+      // 8kHz clients can still talk to us — we just resample internally
+      // if needed.
+      sample_rate: 24000 as const,
       channels: clientAudioParams.channels ?? 1,
       frame_duration: clientAudioParams.frame_duration ?? 60,
     },
@@ -235,7 +248,8 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   ws.send(serializeServerMessage(serverHello));
   log.info(
     `xiaozhi: ${deviceId} hello acked, session=${sessionId}, ` +
-    `audio=${clientAudioParams.sample_rate ?? 16000}Hz/${clientAudioParams.channels ?? 1}ch/` +
+    `audio_in=${clientAudioParams.sample_rate ?? 16000}Hz/${clientAudioParams.channels ?? 1}ch ` +
+    `audio_out=24000Hz/${clientAudioParams.channels ?? 1}ch/` +
     `${clientAudioParams.frame_duration ?? 60}ms`,
   );
 
@@ -510,6 +524,24 @@ async function dispatchClientMessage(
         // the flag set, causing the next TTS to bail out at the first
         // chunk — device would play silence for the new turn.)
         session.aborted = false;
+        // Bug 7 fix: clear the audio buffer on each listen.start.
+        // The esp32 firmware pushes 35 wake-word-tail opus frames in
+        // ~232ms before sending the ListenMessage(detect) text, and
+        // our IDLE→LISTENING auto-promotion accepts those frames
+        // into session.audioBuffer. Without a clear here, the next
+        // listen.start (for a real user turn) just *appends* to the
+        // same buffer — ASR then transcribes
+        // "wake-word-tail + user speech" as a garbled mash, e.g.
+        // "你好小小志丽置之志明明今天天天气怎么样" instead of
+        // "今天天气怎么样".
+        const hadStale = session.audioBuffer.length > 0;
+        if (hadStale) {
+          log.info(
+            `xiaozhi: ${ctx.deviceId} clearing ${session.audioBuffer.length} stale opus ` +
+            `frames from previous turn before starting new listen`,
+          );
+          session.audioBuffer.length = 0;
+        }
         // M3.2 stub: just record the start; full audio dispatch lands in M3.4
         // when we have the openclaw channelRuntime wired in.
         transitionTo(session, "LISTENING");
