@@ -30,7 +30,12 @@ import {
   transitionTo,
   type SessionContext,
 } from "../session.js";
-import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig } from "../api.js";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig, getMetricsEnabled } from "../api.js";
+// v0.4.0-rc2 (batch 2): metrics helpers. The cfg-derived
+// `getMetricsEnabled()` flag is read on every call site; when false
+// (the default) the helpers are no-ops AND the `if (getMetricsEnabled())`
+// guards in this file elide the labels-object allocation entirely.
+import { incCounter, observe } from "../metrics.js";
 // v0.4.0-rc1 (batch 1): streaming TTS pipeline + text cleaner. The
 // imports below are only used when cfg.useStreamingTts === true;
 // when the flag is false (default), the legacy streamTtsToOpusFrames
@@ -132,11 +137,20 @@ export async function handleListenStop(
   } catch (err) {
     const e = err as ASRError;
     log.error(`xiaozhi: ${ctx.deviceId} ASR failed:`, e.message);
+    // v0.4.0-rc2 (batch 2): metric — failed ASR transcribe.
+    if (getMetricsEnabled()) {
+      incCounter("xiaozhi_asr_transcribe_total", { device: ctx.deviceId, status: "error" });
+    }
     transitionTo(session, "IDLE");
     return;
   }
   const text = asrResult.text.trim();
   const asrMs = Date.now() - t0;
+  // v0.4.0-rc2 (batch 2): metrics — successful ASR transcribe + duration.
+  if (getMetricsEnabled()) {
+    incCounter("xiaozhi_asr_transcribe_total", { device: ctx.deviceId, status: "ok" });
+    observe("xiaozhi_asr_duration_ms", asrMs, { device: ctx.deviceId, provider: asr.name });
+  }
   log.info(
     `xiaozhi: ${ctx.deviceId} asr ${asrMs}ms → "${text}" ` +
     `(rtf=${asrResult.elapsedMs ? (asrResult.elapsedMs / (pcm.length / 2 / 16)).toFixed(2) : "n/a"})`,
@@ -194,6 +208,12 @@ export async function handleListenStop(
           return;
         }
 
+        // v0.4.0-rc2 (batch 2): LLM duration metric — measure wall
+        // time from deliver entry until TTS start (the "agent
+        // thought" wall time, which is what we care about for
+        // monitoring tail-latency on the LLM leg).
+        const llmStart = Date.now();
+
         // 1. Transition to SPEAKING FIRST so any concurrent mic frames
         //    arriving during the TTS pipeline get dropped (they're speaker
         //    echo, not user speech).
@@ -210,6 +230,13 @@ export async function handleListenStop(
         log.info(
           `xiaozhi: ${ctx.deviceId} llm reply: "${replyText.slice(0, 80)}${replyText.length > 80 ? "…" : ""}"`,
         );
+        // v0.4.0-rc2 (batch 2): record the LLM wall time. The
+        // openclaw deliver callback already includes the LLM
+        // roundtrip; we measure from the deliver entry to the
+        // tts.start emission as a proxy for "agent thought time".
+        if (getMetricsEnabled()) {
+          observe("xiaozhi_llm_duration_ms", Date.now() - llmStart, { device: ctx.deviceId });
+        }
 
         // 4. TTS pipeline: stream reply text → PCM chunks → opus frames
         //    Then send sentence_start (with text), frames, tts.stop.
@@ -248,11 +275,18 @@ export async function handleListenStop(
             handle.feed(replyText);
             await handle.close();
             const ttsMs = Date.now() - ttsPipelineStart;
+            // v0.4.0-rc2 (batch 2): TTS duration metric (streaming path).
+            if (getMetricsEnabled()) {
+              observe("xiaozhi_tts_duration_ms", ttsMs, { device: ctx.deviceId, mode: "streaming", status: "ok" });
+            }
             log.info(
               `xiaozhi: ${ctx.deviceId} streaming-tts ${ttsMs}ms (reply=${replyText.length} chars)`,
             );
           } catch (err) {
             log.error(`xiaozhi: ${ctx.deviceId} streaming tts failed:`, (err as Error).message);
+            if (getMetricsEnabled()) {
+              incCounter("xiaozhi_tts_failure_total", { device: ctx.deviceId, mode: "streaming" });
+            }
             try { sendTtsStop(ctx.ws, ctx.sessionId); } catch { /* ignore */ }
           } finally {
             markTtsEnded(session, replyText, log);
@@ -265,6 +299,10 @@ export async function handleListenStop(
         try {
           opusFrames = await streamTtsToOpusFrames(tts, replyText, ttsEncoder, log, session);
           const ttsMs = Date.now() - ttsStart;
+          // v0.4.0-rc2 (batch 2): TTS duration metric (legacy path).
+          if (getMetricsEnabled()) {
+            observe("xiaozhi_tts_duration_ms", ttsMs, { device: ctx.deviceId, mode: "legacy", status: "ok" });
+          }
           log.info(
             `xiaozhi: ${ctx.deviceId} tts ${ttsMs}ms → ${opusFrames.length} opus frames ` +
             `(${(replyText.length / (ttsMs / 1000)).toFixed(0)} chars/sec)`,
@@ -274,6 +312,9 @@ export async function handleListenStop(
           sendTtsStop(ctx.ws, ctx.sessionId);
         } catch (err) {
           const e = err as TTSError;
+          if (getMetricsEnabled()) {
+            incCounter("xiaozhi_tts_failure_total", { device: ctx.deviceId, mode: "legacy" });
+          }
           log.error(`xiaozhi: ${ctx.deviceId} TTS failed:`, e.message);
           // Bug 1 fix: still send tts.stop so device doesn't stay in
           // SPEAKING forever, and markTtsEnded so the post-TTS grace
@@ -289,8 +330,17 @@ export async function handleListenStop(
       onRecordError: (err) => log.error(`xiaozhi: record error:`, err),
       onDispatchError: (err) => log.error(`xiaozhi: dispatch error:`, err),
     });
+    // v0.4.0-rc2 (batch 2): dispatch succeeded (deliver was called
+    // and the agent loop returned). Increment the ok counter here so
+    // we don't double-count on the throw path.
+    if (getMetricsEnabled()) {
+      incCounter("xiaozhi_dispatch_total", { device: ctx.deviceId, status: "ok" });
+    }
   } catch (err) {
     log.error(`xiaozhi: dispatch failed for ${ctx.deviceId}:`, (err as Error).message);
+    if (getMetricsEnabled()) {
+      incCounter("xiaozhi_dispatch_total", { device: ctx.deviceId, status: "error" });
+    }
     sendLlmMessage(ctx.ws, ctx.sessionId, undefined, `Error: ${(err as Error).message}`);
     transitionTo(session, "IDLE");
   } finally {

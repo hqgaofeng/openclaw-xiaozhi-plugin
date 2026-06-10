@@ -23,6 +23,9 @@ import { handleEsp32Connection } from "./inbound.js";
 import { getDeviceRegistry } from "./tools.js";
 import { setXiaozhiConfig } from "./api.js";
 import { handleOtaRequest } from "./ota.js";
+// v0.4.0-rc2 (batch 2): metrics endpoint — same shape as OTA so the
+// HTTP server's path router just needs to add a new prefix.
+import { metricsHandler } from "./metrics.js";
 
 export interface GatewayContext {
   cfg: unknown;
@@ -106,15 +109,25 @@ export async function startWssServer(
   // M3.5: Same HTTP server also serves /api/xiaozhi/ota[ /] (POST + GET) for
   // xiaozhi-esp32 firmware OTA checks. WebSocket upgrade still wins for the
   // account.path prefix (handled by the WSS attached below).
+  // v0.4.0-rc2 (batch 2): also serves /api/xiaozhi/metrics[ /] (GET only).
+  // The handler itself returns 404 when metricsEnabled=false, so the
+  // server doesn't need to know the flag — it just dispatches the
+  // request and lets the handler decide.
   const httpServer = createServer((req, res) => {
     const url = req.url ?? "";
-    if (
-      url === "/api/xiaozhi/ota" ||
-      url === "/api/xiaozhi/ota/" ||
-      url === "/health"
-    ) {
+    const isOta = url === "/api/xiaozhi/ota" || url === "/api/xiaozhi/ota/";
+    const isMetrics = url === "/api/xiaozhi/metrics" || url === "/api/xiaozhi/metrics/";
+    const isHealth = url === "/health";
+    if (isOta || isMetrics || isHealth) {
+      // Pick the right handler. Pre-batch-2 code routed /health and
+      // /api/xiaozhi/ota both to handleOtaRequest; we keep that
+      // behavior (the OTA handler is happy to respond to GET /health
+      // with a default OTA response, which is harmless and matches
+      // whatever was deployed in v0.3.x). Metrics gets its own
+      // handler that respects the feature flag.
+      const handler = isMetrics ? metricsHandler : handleOtaRequest;
       // Async handler; Node http will keep the socket open until res.end().
-      Promise.resolve(handleOtaRequest(req, res)).catch((err) => {
+      Promise.resolve(handler(req, res)).catch((err) => {
         console.error(`[xiaozhi] HTTP handler error: ${(err as Error).message}`);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "text/plain" });

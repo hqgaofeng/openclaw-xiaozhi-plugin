@@ -14,6 +14,8 @@
 
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { handleOtaRequest } from "./ota.js";
+import { metricsHandler, setMetricsEnabled as setMetricsModuleEnabled } from "./metrics.js";
+import { getMetricsEnabled as getMetricsEnabledFromCfg } from "./api.js";
 
 /**
  * Register plugin-level concerns that don't fit into a ChannelPlugin
@@ -36,5 +38,34 @@ export function registerXiaozhiPlugin(api: OpenClawPluginApi): void {
     auth: "plugin",
     handler: handleOtaRequest,
   });
-  console.log("[xiaozhi] registered OTA routes: /api/xiaozhi/ota, /api/xiaozhi/ota/");
+
+  // v0.4.0-rc2 (batch 2): metrics endpoint. Mirrors OTA in shape and
+  // auth. Disabled by default — when channels.xiaozhi.metricsEnabled
+  // is false (the default), the handler returns 404 and the route
+  // effectively doesn't exist. When enabled, returns a JSON snapshot
+  // of Counters / Histograms / Gauges + uptime.
+  api.registerHttpRoute({
+    path: "/api/xiaozhi/metrics",
+    auth: "plugin",
+    handler: metricsHandler,
+  });
+  api.registerHttpRoute({
+    path: "/api/xiaozhi/metrics/",
+    auth: "plugin",
+    handler: metricsHandler,
+  });
+  // Push the cfg-derived flag into the metrics module so its helpers
+  // gate on a single boolean. Done once at plugin registration;
+  // the cfg is captured by setXiaozhiConfig() before this point.
+  setMetricsModuleEnabled(getMetricsEnabledFromCfg());
+
+  console.log(
+    "[xiaozhi] registered OTA + metrics routes: " +
+    "/api/xiaozhi/ota, /api/xiaozhi/ota/, " +
+    "/api/xiaozhi/metrics, /api/xiaozhi/metrics/",
+  );
+  console.log(
+    `[xiaozhi] metricsEnabled=${getMetricsEnabledFromCfg()} ` +
+    `(disabled → /api/xiaozhi/metrics returns 404)`,
+  );
 }

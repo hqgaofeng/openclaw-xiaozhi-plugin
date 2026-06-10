@@ -62,6 +62,20 @@ export function getXiaozhiTtsConfig(): {
 }
 
 /**
+ * v0.4.0-rc2 (batch 2): read the metrics feature flag from
+ * `channels.xiaozhi.metricsEnabled`. Defaults to false (off) — the
+ * metrics module is a no-op until explicitly enabled. We push this
+ * into the metrics module from registerXiaozhiPlugin() so the helpers
+ * have a single boolean to gate on.
+ */
+export function getMetricsEnabled(): boolean {
+  const ch = getXiaozhiChannelConfig();
+  if (!ch) return false;
+  const v = (ch as { metricsEnabled?: unknown }).metricsEnabled;
+  return v === true;
+}
+
+/**
  * v0.3.5: return the raw channels.xiaozhi config object so callers
  * can read non-schema-declared fields (wakeupWords / enableGreeting /
  * greeting — openclaw's schema validator strips these from

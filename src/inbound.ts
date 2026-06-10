@@ -71,6 +71,11 @@ import { registerEsp32Tools, unregisterEsp32Tools } from "./mcp/registry.js";
 import type { McpTool } from "./mcp/protocol.js";
 import { handleListenStop } from "./handle/esp32ListenHandler.js";
 import { startVadWatcher, bufferHasSpeech } from "./vad.js";
+// v0.4.0-rc2 (batch 2): metrics instrumentation. All call sites are
+// gated by `if (getMetricsEnabled())` so the labels-object allocation
+// is elided entirely when the feature is off.
+import { incCounter, setGauge } from "./metrics.js";
+import { getMetricsEnabled } from "./api.js";
 
 export interface Esp32ConnectionCtx {
   account: XiaozhiAccount;
@@ -122,6 +127,16 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   const codec = new OpusCodec(16000);
   const session = createSessionContext(deviceId, sessionId, codec);
   ctx.sessionStore.register(deviceId, session);
+  // v0.4.0-rc2 (batch 2): metrics — bump the connection counter and
+  // active-sessions gauge on every new esp32 connection.
+  if (getMetricsEnabled()) {
+    incCounter("xiaozhi_connection_total", { device: deviceId });
+    setGauge(
+      "xiaozhi_active_sessions",
+      ctx.sessionStore.list().length,
+      {},
+    );
+  }
 
   // M3.7.3: install a logger that names this session (so we can grep
   // session-scoped log lines when chasing per-device bugs)
@@ -355,6 +370,16 @@ export async function handleEsp32Connection(ctx: Esp32ConnectionCtx): Promise<vo
   cleanupSession(session);
   ctx.sessionStore.unregister(deviceId);
   unregisterEsp32Tools(deviceId);
+  // v0.4.0-rc2 (batch 2): refresh the active-sessions gauge on
+  // disconnect. Reading through sessionStore.list() is cheap
+  // (in-memory Map) and gives us a consistent post-unregister view.
+  if (getMetricsEnabled()) {
+    setGauge(
+      "xiaozhi_active_sessions",
+      ctx.sessionStore.list().length,
+      {},
+    );
+  }
 }
 
 interface WsEvent {
@@ -635,9 +660,29 @@ async function dispatchClientMessage(
                   // Drain the buffer anyway so we don't accumulate
                   // future echo frames, but skip the ASR+dispatch.
                   drainAudioBuffer(session);
+                  // v0.4.0-rc2 (batch 2): VAD stop was triggered, but
+                  // the dispatch was suppressed because we're still
+                  // inside the post-TTS echo grace window. Count
+                  // these as "suppressed" so the operator can see
+                  // how often the grace window is doing real work.
+                  if (getMetricsEnabled()) {
+                    incCounter(
+                      "xiaozhi_post_tts_grace_suppressed_total",
+                      { device: ctx.deviceId },
+                    );
+                  }
                   transitionTo(session, "IDLE");
                   return;
                 }
+              }
+              // v0.4.0-rc2 (batch 2): VAD-driven silence triggered
+              // a virtual listen-stop. Count it as a separate source
+              // from device-issued listen-stop messages so we can
+              // tell whether the device is auto-closing or our own
+              // VAD is doing it.
+              if (getMetricsEnabled()) {
+                incCounter("xiaozhi_vad_silence_triggered_total", { device: ctx.deviceId });
+                incCounter("xiaozhi_listen_stop_total", { device: ctx.deviceId, source: "vad" });
               }
               // Mirror what ListenMessage(stop) would do — drain audio,
               // run ASR, dispatch to LLM, push TTS. handleListenStop
@@ -661,6 +706,13 @@ async function dispatchClientMessage(
         if (session.vadWatcher) {
           session.vadWatcher.stop();
           session.vadWatcher = null;
+        }
+        // v0.4.0-rc2 (batch 2): count explicit listen-stop messages
+        // from the device. VAD-triggered stops are counted separately
+        // (vad_silence_triggered_total) so the two paths are
+        // distinguishable in the snapshot.
+        if (getMetricsEnabled()) {
+          incCounter("xiaozhi_listen_stop_total", { device: ctx.deviceId, source: "device" });
         }
         await handleListenStop(ctx, session);
         return;

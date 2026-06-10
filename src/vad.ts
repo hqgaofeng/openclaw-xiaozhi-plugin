@@ -49,6 +49,12 @@
 
 import { OpusCodec } from "./audio.js";
 import type { SessionContext } from "./session.js";
+// v0.4.0-rc2 (batch 2): metrics — record the wall time of each
+// computeRms() call. Useful for diagnosing whether the VAD itself
+// is becoming a bottleneck on large buffers (e.g. long turns in
+// realtime mode).
+import { observe as observeMetric } from "./metrics.js";
+import { getMetricsEnabled } from "./api.js";
 
 /** Anything below this RMS counts as silence (int16 domain). */
 const SILENCE_RMS_THRESHOLD = 600;
@@ -203,6 +209,10 @@ export function startVadWatcher(opts: VadWatcherOpts): VadWatcher {
  * positives (cut user off mid-sentence).
  */
 export function computeRms(pcm: Buffer): number {
+  // v0.4.0-rc2 (batch 2): instrument the wall-time cost of computeRms
+  // itself. The VAD watcher calls this once per frame per device, so
+  // cost scales linearly with active devices — keep an eye on it.
+  const start = Date.now();
   if (pcm.length < 2) return 0;
   let sum = 0;
   const n = pcm.length / 2;
@@ -210,7 +220,11 @@ export function computeRms(pcm: Buffer): number {
     const s = pcm.readInt16LE(i);
     sum += s * s;
   }
-  return Math.sqrt(sum / n);
+  const result = Math.sqrt(sum / n);
+  if (getMetricsEnabled()) {
+    observeMetric("xiaozhi_vad_duration_ms", Date.now() - start, { bytes: String(pcm.length) });
+  }
+  return result;
 }
 
 /**
