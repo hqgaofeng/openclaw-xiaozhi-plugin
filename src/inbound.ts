@@ -26,6 +26,10 @@ import { OpusCodec } from "./audio.js";
 // uses for the Listen(stop) path. The detect path was M3.3b-stubbed to
 // text-only and is now being upgraded to match.
 import { streamTtsToOpusFrames } from "./handle/esp32ListenHandler.js";
+// v0.4.0-rc1 (batch 1): streaming TTS pipeline opt-in. Used only when
+// `channels.xiaozhi.useStreamingTts === true`; when false (default),
+// the legacy `streamTtsToOpusFrames` path is unchanged.
+import { startTtsPipeline } from "./ttsPipeline.js";
 
 // v0.3.5: helper for wake-word short-circuit (mirrors
 //   xiaozhi-esp32-server core/utils/util.py:remove_punctuation_and_length).
@@ -450,6 +454,36 @@ async function deliverLocalReply(
   const encoder = new OpusCodec(24000);
   const ttsStart = Date.now();
   try {
+    // v0.4.0-rc1 (batch 1): opt-in streaming TTS pipeline. When
+    // `useStreamingTts` is true in the xiaozhi channel config, we
+    // run the new 3-queue pipeline. When false (default), we fall
+    // through to the legacy `streamTtsToOpusFrames` helper below.
+    const channelCfg = getXiaozhiChannelConfig() as { useStreamingTts?: boolean } | undefined;
+    if (channelCfg?.useStreamingTts === true) {
+      const streamingStart = Date.now();
+      const handle = startTtsPipeline({
+        ws: ctx.ws,
+        sessionId: ctx.sessionId,
+        session,
+        log: {
+          info: (m: string, ...a: unknown[]) => log.info(m, ...a),
+          warn: (m: string, ...a: unknown[]) => log.warn(m, ...a),
+          error: (m: string, ...a: unknown[]) => log.error(m, ...a),
+          debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
+        } as never,
+        cfg: { useStreamingTts: true, sampleRate: 24000 },
+        tts: tts as never,
+        replyText: trimmed,
+        onError: (err) => log.error(`xiaozhi: ${ctx.deviceId} streaming tts error:`, (err as Error).message),
+      });
+      handle.feed(trimmed);
+      await handle.close();
+      const streamingMs = Date.now() - streamingStart;
+      log.info(
+        `xiaozhi: ${ctx.deviceId} streaming-tts ${streamingMs}ms (reply=${trimmed.length} chars)`,
+      );
+      return;
+    }
     const opusFrames = await streamTtsToOpusFrames(
       tts as never,
       trimmed,
@@ -774,6 +808,37 @@ async function dispatchClientMessage(
               sendLlmMessage(ctx.ws, ctx.sessionId, undefined, text);
               const ttsStart = Date.now();
               try {
+                // v0.4.0-rc1 (batch 1): opt-in streaming TTS pipeline.
+                // The flag is read on every deliver callback; the
+                // legacy `streamTtsToOpusFrames` path runs unchanged
+                // when useStreamingTts is false (default).
+                const channelCfg = getXiaozhiChannelConfig() as { useStreamingTts?: boolean } | undefined;
+                if (channelCfg?.useStreamingTts === true) {
+                  const streamingStart = Date.now();
+                  const handle = startTtsPipeline({
+                    ws: ctx.ws,
+                    sessionId: ctx.sessionId,
+                    session,
+                    log: {
+                      info: (m: string, ...a: unknown[]) => log.info(m, ...a),
+                      warn: (m: string, ...a: unknown[]) => log.warn(m, ...a),
+                      error: (m: string, ...a: unknown[]) => log.error(m, ...a),
+                      debug: (m: string, ...a: unknown[]) => log.debug(m, ...a),
+                    } as never,
+                    cfg: { useStreamingTts: true, sampleRate: 24000 },
+                    tts: tts as never,
+                    replyText: text,
+                    onError: (err) => log.error(`xiaozhi: ${ctx.deviceId} streaming tts error:`, (err as Error).message),
+                  });
+                  handle.feed(text);
+                  await handle.close();
+                  const streamingMs = Date.now() - streamingStart;
+                  log.info(
+                    `xiaozhi: ${ctx.deviceId} streaming-tts ${streamingMs}ms (reply=${text.length} chars)`,
+                  );
+                  markTtsEnded(session, text, log);
+                  return;
+                }
                 const opusFrames = await streamTtsToOpusFrames(
                   tts as never,
                   text,

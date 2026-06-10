@@ -30,7 +30,15 @@ import {
   transitionTo,
   type SessionContext,
 } from "../session.js";
-import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig } from "../api.js";
+import { buildDirectDmRuntime, getXiaozhiRuntime, getXiaozhiConfig, getXiaozhiAsrConfig, getXiaozhiTtsConfig, getXiaozhiChannelConfig } from "../api.js";
+// v0.4.0-rc1 (batch 1): streaming TTS pipeline + text cleaner. The
+// imports below are only used when cfg.useStreamingTts === true;
+// when the flag is false (default), the legacy streamTtsToOpusFrames
+// path runs untouched and the new modules are never instantiated.
+// We import the symbols unconditionally because TypeScript needs the
+// type information for the conditional block; the runtime cost is
+// zero (top-level imports of pure modules are tree-shakeable).
+import { startTtsPipeline } from "../ttsPipeline.js";
 
 export interface ListenStopCtx {
   account: XiaozhiAccount;
@@ -214,6 +222,44 @@ export async function handleListenStop(
           markTtsEnded(session, replyText, log);
           return;
         }
+
+        // v0.4.0-rc1 (batch 1): opt-in streaming TTS pipeline. When
+        // `useStreamingTts` is true in the xiaozhi channel config, we
+        // run the new 3-queue pipeline. When false (default), we
+        // continue to use the legacy `streamTtsToOpusFrames` helper
+        // with zero behavioural change vs v0.3.0.
+        const channelCfg = getXiaozhiChannelConfig() as { useStreamingTts?: boolean } | undefined;
+        if (channelCfg?.useStreamingTts === true) {
+          const ttsPipelineStart = Date.now();
+          try {
+            const handle = startTtsPipeline({
+              ws: ctx.ws,
+              sessionId: ctx.sessionId,
+              session,
+              log,
+              cfg: { useStreamingTts: true, sampleRate: 24000 },
+              tts,
+              replyText,
+              onError: (err) => log.error(`xiaozhi: ${ctx.deviceId} streaming tts error:`, (err as Error).message),
+            });
+            // For the opt-in path we have a single non-streaming reply
+            // text from the LLM (no token-by-token delivery from the
+            // openclaw runtime yet). Feed it as one chunk and close.
+            handle.feed(replyText);
+            await handle.close();
+            const ttsMs = Date.now() - ttsPipelineStart;
+            log.info(
+              `xiaozhi: ${ctx.deviceId} streaming-tts ${ttsMs}ms (reply=${replyText.length} chars)`,
+            );
+          } catch (err) {
+            log.error(`xiaozhi: ${ctx.deviceId} streaming tts failed:`, (err as Error).message);
+            try { sendTtsStop(ctx.ws, ctx.sessionId); } catch { /* ignore */ }
+          } finally {
+            markTtsEnded(session, replyText, log);
+          }
+          return;
+        }
+
         const ttsStart = Date.now();
         let opusFrames: Buffer[] = [];
         try {
